@@ -113,7 +113,11 @@ export class QQBotChannel implements Channel {
       }
       // Debug: log all received events (op + type)
       logger.debug(
-        { op: payload.op, t: payload.t, d_keys: payload.d ? Object.keys(payload.d) : [] },
+        {
+          op: payload.op,
+          t: payload.t,
+          d_keys: payload.d ? Object.keys(payload.d) : [],
+        },
         'QQ WS event received',
       );
       this.handlePayload(payload);

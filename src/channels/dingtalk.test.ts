@@ -57,7 +57,9 @@ describe('DingTalkChannel', () => {
   describe('setTyping', () => {
     it('should be a no-op (DingTalk does not support typing indicators)', async () => {
       const channel = new DingTalkChannel(clientId, clientSecret, mockOpts);
-      await expect(channel.setTyping('dingtalk:123', true)).resolves.toBeUndefined();
+      await expect(
+        channel.setTyping('dingtalk:123', true),
+      ).resolves.toBeUndefined();
     });
   });
 

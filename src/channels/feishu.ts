@@ -268,8 +268,7 @@ export class FeishuChannel implements Channel {
         path: { user_id: senderId },
         params: { user_id_type: 'open_id' },
       });
-      const name =
-        (resp as any)?.data?.user?.name || (resp as any)?.user?.name;
+      const name = (resp as any)?.data?.user?.name || (resp as any)?.user?.name;
       if (name) return name;
     } catch (err) {
       logger.warn({ err, senderId }, 'Failed to get Feishu user name');

@@ -106,7 +106,9 @@ import { FeishuChannel, FeishuChannelOpts } from './feishu.js';
 
 // --- Test helpers ---
 
-function createTestOpts(overrides?: Partial<FeishuChannelOpts>): FeishuChannelOpts {
+function createTestOpts(
+  overrides?: Partial<FeishuChannelOpts>,
+): FeishuChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),
@@ -122,17 +124,19 @@ function createTestOpts(overrides?: Partial<FeishuChannelOpts>): FeishuChannelOp
   };
 }
 
-function createMessageEvent(overrides: {
-  messageId?: string;
-  chatId?: string;
-  chatType?: string;
-  senderOpenId?: string;
-  senderType?: string;
-  msgType?: string;
-  content?: string;
-  mentions?: any[];
-  createTime?: string;
-} = {}) {
+function createMessageEvent(
+  overrides: {
+    messageId?: string;
+    chatId?: string;
+    chatType?: string;
+    senderOpenId?: string;
+    senderType?: string;
+    msgType?: string;
+    content?: string;
+    mentions?: any[];
+    createTime?: string;
+  } = {},
+) {
   return {
     sender: {
       sender_id: {
@@ -155,7 +159,9 @@ function createMessageEvent(overrides: {
   };
 }
 
-async function triggerMessageEvent(data: ReturnType<typeof createMessageEvent>) {
+async function triggerMessageEvent(
+  data: ReturnType<typeof createMessageEvent>,
+) {
   await larkRef.dispatcher?.dispatch('im.message.receive_v1', data);
 }
 
@@ -164,7 +170,11 @@ function currentClient() {
 }
 
 function makeChannel(optsOverrides?: Partial<FeishuChannelOpts>) {
-  return new FeishuChannel('cli_test_app_id', 'test_app_secret', createTestOpts(optsOverrides));
+  return new FeishuChannel(
+    'cli_test_app_id',
+    'test_app_secret',
+    createTestOpts(optsOverrides),
+  );
 }
 
 // --- Tests ---
@@ -203,7 +213,10 @@ describe('FeishuChannel', () => {
       const channel = makeChannel();
       await channel.connect();
       expect(currentClient().request).toHaveBeenCalledWith(
-        expect.objectContaining({ method: 'GET', url: expect.stringContaining('bot/v3/info') }),
+        expect.objectContaining({
+          method: 'GET',
+          url: expect.stringContaining('bot/v3/info'),
+        }),
       );
     });
 
@@ -228,7 +241,11 @@ describe('FeishuChannel', () => {
   describe('message handling', () => {
     it('delivers text message for registered chat', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(createMessageEvent());
@@ -254,10 +271,16 @@ describe('FeishuChannel', () => {
 
     it('only emits metadata for unregistered chats', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
-      await triggerMessageEvent(createMessageEvent({ chatId: 'oc_unknown_chat' }));
+      await triggerMessageEvent(
+        createMessageEvent({ chatId: 'oc_unknown_chat' }),
+      );
 
       expect(opts.onChatMetadata).toHaveBeenCalled();
       expect(opts.onMessage).not.toHaveBeenCalled();
@@ -265,7 +288,11 @@ describe('FeishuChannel', () => {
 
     it('skips messages with no message data', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent({ sender: {}, message: null } as any);
@@ -284,7 +311,11 @@ describe('FeishuChannel', () => {
           },
         })),
       });
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -302,10 +333,16 @@ describe('FeishuChannel', () => {
 
     it('converts create_time ms string to ISO timestamp', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
-      await triggerMessageEvent(createMessageEvent({ createTime: '1704067200000' }));
+      await triggerMessageEvent(
+        createMessageEvent({ createTime: '1704067200000' }),
+      );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'feishu:oc_test_group_id',
@@ -315,10 +352,16 @@ describe('FeishuChannel', () => {
 
     it('resolves user name from contact API', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
-      await triggerMessageEvent(createMessageEvent({ senderOpenId: 'ou_user_456' }));
+      await triggerMessageEvent(
+        createMessageEvent({ senderOpenId: 'ou_user_456' }),
+      );
 
       expect(currentClient().contact.v3.user.get).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -334,12 +377,20 @@ describe('FeishuChannel', () => {
 
     it('falls back to open_id when user API fails', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
-      currentClient().contact.v3.user.get.mockRejectedValueOnce(new Error('API error'));
+      currentClient().contact.v3.user.get.mockRejectedValueOnce(
+        new Error('API error'),
+      );
 
-      await triggerMessageEvent(createMessageEvent({ senderOpenId: 'ou_unknown_user' }));
+      await triggerMessageEvent(
+        createMessageEvent({ senderOpenId: 'ou_unknown_user' }),
+      );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'feishu:oc_test_group_id',
@@ -349,10 +400,16 @@ describe('FeishuChannel', () => {
 
     it('is_from_me is always false', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
-      await triggerMessageEvent(createMessageEvent({ senderOpenId: 'ou_bot_123' }));
+      await triggerMessageEvent(
+        createMessageEvent({ senderOpenId: 'ou_bot_123' }),
+      );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'feishu:oc_test_group_id',
@@ -366,7 +423,11 @@ describe('FeishuChannel', () => {
   describe('deduplication', () => {
     it('skips duplicate message IDs', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       const event = createMessageEvent({ messageId: 'om_dup_001' });
@@ -378,7 +439,11 @@ describe('FeishuChannel', () => {
 
     it('processes different message IDs independently', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(createMessageEvent({ messageId: 'om_a' }));
@@ -393,7 +458,11 @@ describe('FeishuChannel', () => {
   describe('built-in commands', () => {
     it('replies to /chatid with chat info and does not call onMessage', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -413,7 +482,11 @@ describe('FeishuChannel', () => {
 
     it('replies to /ping with online status', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -436,13 +509,19 @@ describe('FeishuChannel', () => {
   describe('@mention translation', () => {
     it('prepends trigger when bot is @mentioned', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect(); // botOpenId = 'ou_bot_123'
 
       await triggerMessageEvent(
         createMessageEvent({
           content: JSON.stringify({ text: 'Hey @_user_1 what do you think?' }),
-          mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot_123' }, name: 'Jonesy' }],
+          mentions: [
+            { key: '@_user_1', id: { open_id: 'ou_bot_123' }, name: 'Jonesy' },
+          ],
         }),
       );
 
@@ -456,13 +535,19 @@ describe('FeishuChannel', () => {
 
     it('does not prepend trigger when TRIGGER_PATTERN already matches', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
         createMessageEvent({
           content: JSON.stringify({ text: '@Jonesy hello @_user_1' }),
-          mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot_123' }, name: 'Jonesy' }],
+          mentions: [
+            { key: '@_user_1', id: { open_id: 'ou_bot_123' }, name: 'Jonesy' },
+          ],
         }),
       );
 
@@ -472,7 +557,11 @@ describe('FeishuChannel', () => {
 
     it('replaces @mention placeholder keys with display names', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -495,7 +584,11 @@ describe('FeishuChannel', () => {
 
     it('does not modify content when no mentions', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -517,11 +610,17 @@ describe('FeishuChannel', () => {
   describe('content extraction', () => {
     it('extracts text from text messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ content: JSON.stringify({ text: 'Hello world' }) }),
+        createMessageEvent({
+          content: JSON.stringify({ text: 'Hello world' }),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -532,7 +631,11 @@ describe('FeishuChannel', () => {
 
     it('extracts text from post (rich text) messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       const postContent = {
@@ -548,22 +651,34 @@ describe('FeishuChannel', () => {
       };
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'post', content: JSON.stringify(postContent) }),
+        createMessageEvent({
+          msgType: 'post',
+          content: JSON.stringify(postContent),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'feishu:oc_test_group_id',
-        expect.objectContaining({ content: expect.stringContaining('My Title') }),
+        expect.objectContaining({
+          content: expect.stringContaining('My Title'),
+        }),
       );
     });
 
     it('returns [Image] for image messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'image', content: JSON.stringify({ image_key: 'img_xyz' }) }),
+        createMessageEvent({
+          msgType: 'image',
+          content: JSON.stringify({ image_key: 'img_xyz' }),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -574,7 +689,11 @@ describe('FeishuChannel', () => {
 
     it('returns [Audio] for audio messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -589,7 +708,11 @@ describe('FeishuChannel', () => {
 
     it('returns [Video] for media messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -604,11 +727,18 @@ describe('FeishuChannel', () => {
 
     it('includes file name in file message placeholder', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'file', content: JSON.stringify({ file_name: 'report.pdf' }) }),
+        createMessageEvent({
+          msgType: 'file',
+          content: JSON.stringify({ file_name: 'report.pdf' }),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -619,7 +749,11 @@ describe('FeishuChannel', () => {
 
     it('uses "file" as fallback file name when missing', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -634,7 +768,11 @@ describe('FeishuChannel', () => {
 
     it('returns [Sticker] for sticker messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
@@ -649,11 +787,18 @@ describe('FeishuChannel', () => {
 
     it('returns [Card] for interactive messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'interactive', content: JSON.stringify({}) }),
+        createMessageEvent({
+          msgType: 'interactive',
+          content: JSON.stringify({}),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -664,11 +809,18 @@ describe('FeishuChannel', () => {
 
     it('returns [Shared Group] for share_chat messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'share_chat', content: JSON.stringify({}) }),
+        createMessageEvent({
+          msgType: 'share_chat',
+          content: JSON.stringify({}),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -679,11 +831,18 @@ describe('FeishuChannel', () => {
 
     it('returns [Shared Contact] for share_user messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'share_user', content: JSON.stringify({}) }),
+        createMessageEvent({
+          msgType: 'share_user',
+          content: JSON.stringify({}),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -694,11 +853,18 @@ describe('FeishuChannel', () => {
 
     it('returns [Merge Forward] for merge_forward messages', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(
-        createMessageEvent({ msgType: 'merge_forward', content: JSON.stringify({}) }),
+        createMessageEvent({
+          msgType: 'merge_forward',
+          content: JSON.stringify({}),
+        }),
       );
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -709,7 +875,11 @@ describe('FeishuChannel', () => {
 
     it('handles malformed JSON content gracefully', async () => {
       const opts = createTestOpts();
-      const channel = new FeishuChannel('cli_test_app_id', 'test_app_secret', opts);
+      const channel = new FeishuChannel(
+        'cli_test_app_id',
+        'test_app_secret',
+        opts,
+      );
       await channel.connect();
 
       await triggerMessageEvent(createMessageEvent({ content: 'not-json' }));
@@ -746,7 +916,10 @@ describe('FeishuChannel', () => {
       const channel = makeChannel();
       await channel.connect();
 
-      await channel.sendMessage('feishu:oc_test_group_id', '**bold** and `code`');
+      await channel.sendMessage(
+        'feishu:oc_test_group_id',
+        '**bold** and `code`',
+      );
 
       expect(currentClient().im.v1.message.create).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -775,7 +948,9 @@ describe('FeishuChannel', () => {
       const channel = makeChannel();
       await channel.connect();
 
-      currentClient().im.v1.message.create.mockRejectedValueOnce(new Error('Network error'));
+      currentClient().im.v1.message.create.mockRejectedValueOnce(
+        new Error('Network error'),
+      );
 
       await expect(
         channel.sendMessage('feishu:oc_test_group_id', 'Will fail'),
@@ -826,7 +1001,10 @@ describe('FeishuChannel', () => {
       const channel = makeChannel();
       await channel.connect();
 
-      await channel.sendMessage('feishu:oc_test_group_id', 'Just a plain message');
+      await channel.sendMessage(
+        'feishu:oc_test_group_id',
+        'Just a plain message',
+      );
 
       expect(currentClient().im.v1.message.create).toHaveBeenCalledWith(
         expect.objectContaining({
