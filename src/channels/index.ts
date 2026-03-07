@@ -11,6 +11,9 @@ import './feishu.js';
 
 // gmail
 
+// qq
+import './qq.js';
+
 // slack
 
 // telegram
