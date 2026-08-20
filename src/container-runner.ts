@@ -44,6 +44,10 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  /** Visible assistant text as emitted by the model before the final result. */
+  streamDelta?: string;
+  /** True only for the SDK's terminal result/error for one user turn. */
+  isFinalResult?: boolean;
   newSessionId?: string;
   error?: string;
 }
@@ -144,16 +148,42 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
+  // Sync only explicitly reviewed skills into each group's .claude/skills/.
+  // The repository may contain a large third-party catalog; presence alone is
+  // not approval to execute a skill in a medical assistant.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsAllowlist = path.join(
+    process.cwd(),
+    'container',
+    'skills-allowlist.txt',
+  );
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
+  if (fs.existsSync(skillsSrc) && fs.existsSync(skillsAllowlist)) {
+    const approvedSkills = fs
+      .readFileSync(skillsAllowlist, 'utf-8')
+      .split('\n')
+      .map((line) => line.replace(/#.*$/, '').trim())
+      .filter(Boolean);
+    for (const skillDir of approvedSkills) {
       const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const skillFile = path.join(srcDir, 'SKILL.md');
+      if (!fs.existsSync(skillFile) || !fs.statSync(srcDir).isDirectory()) {
+        logger.warn({ skillDir }, 'Approved skill is missing; skipping');
+        continue;
+      }
+      const skillText = fs.readFileSync(skillFile, 'utf-8');
+      if (
+        skillText.startsWith('version https://git-lfs.github.com/spec/v1') ||
+        !skillText.startsWith('---\n')
+      ) {
+        logger.warn({ skillDir }, 'Approved skill failed integrity checks');
+        continue;
+      }
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
+  } else {
+    logger.warn('Medical skill allowlist missing; no bundled skills synced');
   }
   mounts.push({
     hostPath: groupSessionsDir,
@@ -170,30 +200,6 @@ function buildVolumeMounts(
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
-    readonly: false,
-  });
-
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-  }
-  mounts.push({
-    hostPath: groupAgentRunnerDir,
-    containerPath: '/app/src',
     readonly: false,
   });
 
@@ -320,6 +326,7 @@ export async function runContainerAgent(
     let parseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
+    let outputCallbackError: unknown;
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
@@ -362,7 +369,17 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            outputChain = outputChain.then(async () => {
+              try {
+                await onOutput(parsed);
+              } catch (err) {
+                outputCallbackError ??= err;
+                logger.error(
+                  { group: group.name, err },
+                  'Failed to deliver streamed container output',
+                );
+              }
+            });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -456,6 +473,15 @@ export async function runContainerAgent(
             'Container timed out after output (idle cleanup)',
           );
           outputChain.then(() => {
+            if (outputCallbackError) {
+              resolve({
+                status: 'error',
+                result: null,
+                newSessionId,
+                error: `Failed to deliver container output: ${String(outputCallbackError)}`,
+              });
+              return;
+            }
             resolve({
               status: 'success',
               result: null,
@@ -560,6 +586,15 @@ export async function runContainerAgent(
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
         outputChain.then(() => {
+          if (outputCallbackError) {
+            resolve({
+              status: 'error',
+              result: null,
+              newSessionId,
+              error: `Failed to deliver container output: ${String(outputCallbackError)}`,
+            });
+            return;
+          }
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',

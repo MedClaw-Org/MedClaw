@@ -79,10 +79,24 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+/**
+ * A single outbound assistant message that can be updated while the model is
+ * generating. Implementations must serialize their own platform updates and
+ * leave the message in a terminal state from both complete() and fail().
+ */
+export interface StreamingMessage {
+  append(delta: string): Promise<void>;
+  complete(finalText: string): Promise<void>;
+  fail(error?: unknown): Promise<void>;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
   sendMessage(jid: string, text: string): Promise<void>;
+  // Optional: create one progressively updated assistant message. Returning
+  // null asks the router to fall back to a normal final message.
+  startMessageStream?(jid: string): Promise<StreamingMessage | null>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

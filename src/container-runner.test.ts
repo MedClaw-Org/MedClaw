@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 
@@ -205,5 +206,85 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+
+  it('forwards partial text deltas before the terminal result', async () => {
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+      streamDelta: 'partial ',
+      newSessionId: 'session-stream',
+    });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'partial answer',
+      isFinalResult: true,
+      newSessionId: 'session-stream',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(resultPromise).resolves.toMatchObject({ status: 'success' });
+    expect(onOutput).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ streamDelta: 'partial ' }),
+    );
+    expect(onOutput).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        result: 'partial answer',
+        isFinalResult: true,
+      }),
+    );
+  });
+
+  it('reports a delivery callback failure instead of acknowledging output', async () => {
+    const onOutput = vi.fn(async () => {
+      throw new Error('messenger unavailable');
+    });
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Undelivered response',
+      newSessionId: 'session-789',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('messenger unavailable');
+  });
+
+  it('never bind-mounts writable agent-runner source into /app/src', async () => {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      vi.fn(async () => {}),
+    );
+
+    const args = vi.mocked(spawn).mock.calls.at(-1)?.[1] as string[];
+    expect(args.some((arg) => arg.includes(':/app/src'))).toBe(false);
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'success' });
   });
 });

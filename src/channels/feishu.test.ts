@@ -7,6 +7,8 @@ vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Jonesy',
   TRIGGER_PATTERN: /^@Jonesy\b/i,
+  matchesTrigger: (content: string, trigger: string) =>
+    content.trim().toLowerCase().startsWith(trigger.trim().toLowerCase()),
 }));
 
 vi.mock('../logger.js', () => ({
@@ -24,6 +26,8 @@ const larkRef = vi.hoisted(() => ({
   client: null as any,
   wsClient: null as any,
   dispatcher: null as any,
+  outboundChannel: null as any,
+  streamController: null as any,
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -87,6 +91,22 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     },
 
     EventDispatcher: MockEventDispatcher,
+    LarkChannel: class MockLarkChannel {
+      stream = vi.fn(async (_to: string, input: any) => {
+        const controller = {
+          append: vi.fn(async () => {}),
+          setContent: vi.fn(async () => {}),
+          messageId: 'om_stream_123',
+        };
+        larkRef.streamController = controller;
+        await input.markdown(controller);
+        return { messageId: 'om_stream_123' };
+      });
+
+      constructor(_opts: any) {
+        larkRef.outboundChannel = this;
+      }
+    },
     AppType: { SelfBuild: 'SelfBuild' },
     Domain: { Feishu: 'feishu.cn' },
     LoggerLevel: { warn: 'warn' },
@@ -944,7 +964,7 @@ describe('FeishuChannel', () => {
       );
     });
 
-    it('does not throw when API fails', async () => {
+    it('rejects when the API fails', async () => {
       const channel = makeChannel();
       await channel.connect();
 
@@ -954,16 +974,71 @@ describe('FeishuChannel', () => {
 
       await expect(
         channel.sendMessage('feishu:oc_test_group_id', 'Will fail'),
-      ).resolves.toBeUndefined();
+      ).rejects.toThrow('Network error');
     });
 
-    it('is no-op when wsClient is null (not connected)', async () => {
+    it('rejects when wsClient is null (not connected)', async () => {
       const channel = makeChannel();
       // Do not call connect()
 
-      await channel.sendMessage('feishu:oc_test_group_id', 'Hello');
+      await expect(
+        channel.sendMessage('feishu:oc_test_group_id', 'Hello'),
+      ).rejects.toThrow('not initialized');
 
       expect(currentClient().im.v1.message.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('message streaming', () => {
+    it('uses one native markdown card and reconciles the final text', async () => {
+      const channel = makeChannel();
+      await channel.connect();
+
+      const stream = await channel.startMessageStream(
+        'feishu:oc_test_group_id',
+      );
+      expect(stream).not.toBeNull();
+
+      await stream!.append('First ');
+      await stream!.append('tokens');
+      await stream!.complete('First tokens, settled.');
+
+      expect(larkRef.outboundChannel.stream).toHaveBeenCalledTimes(1);
+      expect(larkRef.outboundChannel.stream).toHaveBeenCalledWith(
+        'oc_test_group_id',
+        expect.objectContaining({ markdown: expect.any(Function) }),
+      );
+      expect(larkRef.streamController.append).toHaveBeenNthCalledWith(
+        1,
+        'First ',
+      );
+      expect(larkRef.streamController.append).toHaveBeenNthCalledWith(
+        2,
+        'tokens',
+      );
+      expect(larkRef.streamController.setContent).toHaveBeenCalledWith(
+        'First tokens, settled.',
+      );
+    });
+
+    it('refuses to start before the channel is connected', async () => {
+      const channel = makeChannel();
+
+      await expect(
+        channel.startMessageStream('feishu:oc_test_group_id'),
+      ).rejects.toThrow('not initialized');
+    });
+
+    it('puts a started card into a failed terminal state', async () => {
+      const channel = makeChannel();
+      await channel.connect();
+      const stream = await channel.startMessageStream(
+        'feishu:oc_test_group_id',
+      );
+
+      await expect(
+        stream!.fail(new Error('model failed')),
+      ).resolves.toBeUndefined();
     });
   });
 

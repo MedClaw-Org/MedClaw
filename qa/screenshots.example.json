@@ -1,0 +1,22 @@
+{
+  "baseURL": "http://127.0.0.1:3000",
+  "outputDir": "../artifacts/screenshots",
+  "locale": "en-US",
+  "timezoneId": "UTC",
+  "viewports": [
+    { "name": "desktop", "width": 1440, "height": 1000 },
+    { "name": "mobile", "width": 390, "height": 844 }
+  ],
+  "scenarios": [
+    {
+      "id": "replace-with-real-screen",
+      "path": "/",
+      "fixedTime": "2026-01-15T12:00:00.000Z",
+      "readySelector": "body",
+      "captureSegments": true,
+      "maskSelectors": [],
+      "mocks": [],
+      "actions": []
+    }
+  ]
+}

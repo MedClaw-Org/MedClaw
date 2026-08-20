@@ -1,25 +1,27 @@
-# NanoClaw Security Model
+# MedClaw Security and Data Model
 
 ## Trust Model
 
 | Entity | Trust Level | Rationale |
 |--------|-------------|-----------|
-| Main group | Trusted | Private self-chat, admin control |
+| Main group | Trusted | Explicitly selected by the host operator; has administrative visibility |
 | Non-main groups | Untrusted | Other users may be malicious |
 | Container agents | Sandboxed | Isolated execution environment |
-| WhatsApp messages | User input | Potential prompt injection |
+| Messaging input | User input | Potential prompt injection, including from registered chats |
 
 ## Security Boundaries
 
 ### 1. Container Isolation (Primary Boundary)
 
 Agents execute in containers (lightweight Linux VMs), providing:
-- **Process isolation** - Container processes cannot affect the host
+- **Process isolation** - Container processes are separated from the host except for explicit mounts, IPC, and network access
 - **Filesystem isolation** - Only explicitly mounted directories are visible
 - **Non-root execution** - Runs as unprivileged `node` user (uid 1000)
 - **Ephemeral containers** - Fresh environment per invocation (`--rm`)
 
 This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what's mounted.
+
+The container is not a confidentiality boundary against the model provider or the public internet. Agents have unrestricted outbound network access.
 
 ### 2. Mount Security
 
@@ -64,23 +66,41 @@ Messages and task operations are verified against group identity:
 | View all tasks | ✓ | Own only |
 | Manage other groups | ✓ | ✗ |
 
+Group registration and `main` privilege changes are local host operations. Chat commands cannot register themselves or grant/revoke `main`. The database enforces at most one main group.
+
 ### 5. Credential Handling
 
-**Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
+Claude credentials are selected from `.env`, sent to the container over stdin, and supplied to the Claude Agent SDK process. They are not bind-mounted as a file.
 
 **NOT Mounted:**
 - WhatsApp session (`store/auth/`) - host only
 - Mount allowlist - external, never mounted
 - Any credentials matching blocked patterns
 
-**Credential Filtering:**
-Only these environment variables are exposed to containers:
+Before every Bash tool call, MedClaw removes these variables from that subprocess environment:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+const secretVars = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+];
 ```
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+> **Residual risk:** the Claude process must possess a credential to authenticate, and agent tools run in the same container with unrestricted network access. The Bash filter reduces accidental disclosure but is not a complete secret-isolation boundary. Treat registered chats, installed skills, and model/tool instructions as trusted code paths; rotate a credential if exposure is suspected.
+
+### 6. Health Data Flow and Retention
+
+- Inbound and outbound content passes through the configured messaging provider.
+- Prompts, tool results, and responses are processed by Anthropic under the operator's account and provider terms.
+- Web and medical skills may send query content to their documented third-party APIs.
+- Registered-chat messages are stored in `store/messages.db`.
+- Claude session transcripts and files read during a session may be stored under `data/sessions/{group}/.claude/` and `groups/{group}/`.
+- These local files are not encrypted by MedClaw and have no automatic retention or deletion schedule. Host filesystem encryption, backups, access control, retention, and deletion are the operator's responsibility.
+- MedClaw itself does not add analytics telemetry or operate a hosted application backend.
+
+### 7. Medical Safety Boundary
+
+Every agent invocation receives a non-optional medical safety system prompt. It requires emergency escalation for dangerous symptoms, forbids direct prescription changes, and requires uncertainty to be stated. This reduces risk but cannot guarantee clinical correctness. MedClaw is not a medical device, clinician, or emergency service; validate consequential decisions with a qualified professional.
 
 ## Privilege Comparison
 
@@ -98,7 +118,7 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        UNTRUSTED ZONE                             │
-│  WhatsApp Messages (potentially malicious)                        │
+│  Messaging Input (potentially malicious)                         │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
                                  ▼ Trigger check, input escaping

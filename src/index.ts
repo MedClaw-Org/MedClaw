@@ -4,8 +4,8 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
+  matchesTrigger,
   POLL_INTERVAL,
-  TRIGGER_PATTERN,
 } from './config.js';
 import './channels/index.js';
 import {
@@ -28,6 +28,7 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
+  getMessageSequenceBefore,
   getNewMessages,
   getRouterState,
   initDatabase,
@@ -37,9 +38,11 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
+import type { StoredMessage } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { StreamingOutputFilter, stripInternalOutput } from './output-filter.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   isSenderAllowed,
@@ -48,29 +51,58 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import {
+  Channel,
+  NewMessage,
+  RegisteredGroup,
+  StreamingMessage,
+} from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
-let lastTimestamp = '';
+let lastSeenSeq = 0;
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
-let lastAgentTimestamp: Record<string, string> = {};
+let lastAgentSeq: Record<string, number> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
 function loadState(): void {
-  lastTimestamp = getRouterState('last_timestamp') || '';
-  const agentTs = getRouterState('last_agent_timestamp');
+  const storedSeenSeq = Number(getRouterState('last_seen_seq'));
+  lastSeenSeq =
+    Number.isSafeInteger(storedSeenSeq) && storedSeenSeq >= 0
+      ? storedSeenSeq
+      : getMessageSequenceBefore(getRouterState('last_timestamp') || '');
+
+  const storedAgentSeq = getRouterState('last_agent_seq');
   try {
-    lastAgentTimestamp = agentTs ? JSON.parse(agentTs) : {};
+    if (storedAgentSeq) {
+      const parsed = JSON.parse(storedAgentSeq) as Record<string, unknown>;
+      lastAgentSeq = Object.fromEntries(
+        Object.entries(parsed).filter(
+          (entry): entry is [string, number] =>
+            Number.isSafeInteger(entry[1]) && (entry[1] as number) >= 0,
+        ),
+      );
+    } else {
+      const legacyAgentState = getRouterState('last_agent_timestamp');
+      const legacyTimestamps = legacyAgentState
+        ? (JSON.parse(legacyAgentState) as Record<string, string>)
+        : {};
+      lastAgentSeq = Object.fromEntries(
+        Object.entries(legacyTimestamps).map(([jid, timestamp]) => [
+          jid,
+          getMessageSequenceBefore(timestamp, jid),
+        ]),
+      );
+    }
   } catch {
-    logger.warn('Corrupted last_agent_timestamp in DB, resetting');
-    lastAgentTimestamp = {};
+    logger.warn('Corrupted message cursor state in DB, resetting');
+    lastAgentSeq = {};
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
@@ -81,8 +113,8 @@ function loadState(): void {
 }
 
 function saveState(): void {
-  setRouterState('last_timestamp', lastTimestamp);
-  setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+  setRouterState('last_seen_seq', String(lastSeenSeq));
+  setRouterState('last_agent_seq', JSON.stringify(lastAgentSeq));
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -97,8 +129,15 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     return;
   }
 
-  registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
+  if (group.isMain) {
+    logger.warn(
+      { jid, folder: group.folder },
+      'Ignored main privilege on runtime group registration; use local setup',
+    );
+  }
+  const safeGroup: RegisteredGroup = { ...group, isMain: undefined };
+  registeredGroups[jid] = safeGroup;
+  setRegisteredGroup(jid, safeGroup);
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -150,12 +189,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
+  const sinceSeq = lastAgentSeq[chatJid] || 0;
+  const missedMessages = getMessagesSince(chatJid, sinceSeq, ASSISTANT_NAME);
 
   if (missedMessages.length === 0) return true;
 
@@ -164,7 +199,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
+        matchesTrigger(m.content, group.trigger) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
@@ -174,9 +209,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  const previousCursor = lastAgentSeq[chatJid] || 0;
+  lastAgentSeq[chatJid] = missedMessages[missedMessages.length - 1].ingest_seq;
   saveState();
 
   logger.info(
@@ -201,33 +235,126 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let messageStream: StreamingMessage | null = null;
+  let streamUnavailable = false;
+  let streamFilter = new StreamingOutputFilter();
+  let streamedText = '';
+
+  const resetStreamState = () => {
+    messageStream = null;
+    streamUnavailable = false;
+    streamFilter = new StreamingOutputFilter();
+    streamedText = '';
+  };
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
+    if (result.streamDelta) {
+      const visibleDelta = streamFilter.push(result.streamDelta);
+      if (!visibleDelta) return;
+      streamedText += visibleDelta;
+
+      if (!messageStream && !streamUnavailable) {
+        if (!channel.startMessageStream) {
+          streamUnavailable = true;
+        } else {
+          try {
+            messageStream = await channel.startMessageStream(chatJid);
+            streamUnavailable = messageStream === null;
+            if (messageStream) outputSentToUser = true;
+          } catch (err) {
+            streamUnavailable = true;
+            logger.warn(
+              { group: group.name, channel: channel.name, err },
+              'Could not start native message stream; final response will use normal delivery',
+            );
+          }
+        }
+      }
+
+      if (messageStream) {
+        try {
+          await messageStream.append(visibleDelta);
+        } catch (err) {
+          try {
+            await messageStream.fail(err);
+          } catch (finishErr) {
+            logger.warn(
+              { group: group.name, channel: channel.name, err: finishErr },
+              'Could not finalize failed message stream',
+            );
+          }
+          messageStream = null;
+          streamUnavailable = true;
+          logger.warn(
+            { group: group.name, channel: channel.name, err },
+            'Native message stream failed; final response will use normal delivery',
+          );
+        }
+      }
+      return;
+    }
+
+    // A result is the canonical settled answer. Reconcile the progressively
+    // rendered card to it so intermediate tool chatter cannot become final.
     if (result.result) {
       const raw =
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = stripInternalOutput(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        if (messageStream) {
+          await messageStream.complete(text);
+        } else {
+          await channel.sendMessage(chatJid, text);
+        }
         outputSentToUser = true;
       }
+      resetStreamState();
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
     }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+    if (result.isFinalResult && !result.result && result.status === 'success') {
+      const trailing = streamFilter.finish();
+      streamedText += trailing;
+      if (messageStream) {
+        await messageStream.complete(streamedText.trim());
+        outputSentToUser = true;
+      }
+      resetStreamState();
+      resetIdleTimer();
     }
 
     if (result.status === 'error') {
+      if (messageStream) {
+        await messageStream.fail(result.error);
+        outputSentToUser = true;
+        resetStreamState();
+      }
       hadError = true;
+    } else {
+      queue.notifyIdle(chatJid);
     }
   });
+
+  // Defensive terminal flush: a healthy SDK normally sends a result marker,
+  // but a partial answer must never remain as a permanently "typing" card if
+  // an older provider ends its stream without one.
+  const remainingStream = messageStream as StreamingMessage | null;
+  if (remainingStream) {
+    const trailing = streamFilter.finish();
+    streamedText += trailing;
+    if (output === 'success') {
+      await remainingStream.complete(streamedText.trim());
+    } else {
+      await remainingStream.fail('Agent stream ended before a final result');
+      hadError = true;
+    }
+    outputSentToUser = true;
+    resetStreamState();
+  }
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -243,7 +370,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
     // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentSeq[chatJid] = previousCursor;
     saveState();
     logger.warn(
       { group: group.name },
@@ -348,21 +475,24 @@ async function startMessageLoop(): Promise<void> {
   while (true) {
     try {
       const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
+      const { messages, newSeq } = getNewMessages(
         jids,
-        lastTimestamp,
+        lastSeenSeq,
         ASSISTANT_NAME,
       );
+
+      // Advance over every ingested row, including filtered bot/empty rows,
+      // so the poller does not scan the same records forever.
+      if (newSeq > lastSeenSeq) {
+        lastSeenSeq = newSeq;
+        saveState();
+      }
 
       if (messages.length > 0) {
         logger.info({ count: messages.length }, 'New messages');
 
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
         // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        const messagesByGroup = new Map<string, StoredMessage[]>();
         for (const msg of messages) {
           const existing = messagesByGroup.get(msg.chat_jid);
           if (existing) {
@@ -392,18 +522,18 @@ async function startMessageLoop(): Promise<void> {
             const allowlistCfg = loadSenderAllowlist();
             const hasTrigger = groupMessages.some(
               (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
+                matchesTrigger(m.content, group.trigger) &&
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
+          // Pull all messages since lastAgentSeq so non-trigger
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
             chatJid,
-            lastAgentTimestamp[chatJid] || '',
+            lastAgentSeq[chatJid] || 0,
             ASSISTANT_NAME,
           );
           const messagesToSend =
@@ -415,8 +545,8 @@ async function startMessageLoop(): Promise<void> {
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+            lastAgentSeq[chatJid] =
+              messagesToSend[messagesToSend.length - 1].ingest_seq;
             saveState();
             // Show typing indicator while the container processes the piped message
             channel
@@ -439,12 +569,12 @@ async function startMessageLoop(): Promise<void> {
 
 /**
  * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
+ * Handles a crash between advancing the global sequence and processing messages.
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const sinceSeq = lastAgentSeq[chatJid] || 0;
+    const pending = getMessagesSince(chatJid, sinceSeq, ASSISTANT_NAME);
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },

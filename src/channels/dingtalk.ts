@@ -1,19 +1,17 @@
 import axios from 'axios';
+import { randomUUID } from 'crypto';
 import { DWClient, TOPIC_ROBOT, RobotMessage, EventAck } from 'dingtalk-stream';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import { setRegisteredGroup, getRegisteredGroup } from '../db.js';
-import { resolveGroupFolderPath, isValidGroupFolder } from '../group-folder.js';
-import fs from 'fs';
-import path from 'path';
 import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
+  StreamingMessage,
 } from '../types.js';
 
 export interface DingTalkChannelOpts {
@@ -25,9 +23,81 @@ export interface DingTalkChannelOpts {
 // Map conversationId to sessionWebhook for sending replies
 type SessionWebhookMap = Map<string, string>;
 
-// Map conversationId to pending commands (for confirmation flow)
-type PendingCommand = { type: string; timestamp: number };
-type PendingCommandsMap = Map<string, PendingCommand>;
+interface DingTalkConversationTarget {
+  isGroup: boolean;
+  senderStaffId: string;
+}
+
+const DINGTALK_API_BASE = 'https://api.dingtalk.com';
+const STREAM_UPDATE_INTERVAL_MS = 120;
+const STREAM_UPDATE_CHARS = 48;
+
+class DingTalkStreamingMessage implements StreamingMessage {
+  private content = '';
+  private lastSent = '';
+  private closed = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private updateChain = Promise.resolve();
+
+  constructor(
+    private readonly update: (
+      content: string,
+      finalize: boolean,
+      failed: boolean,
+    ) => Promise<void>,
+  ) {}
+
+  async append(delta: string): Promise<void> {
+    if (this.closed || !delta) return;
+    this.content += delta;
+
+    if (this.content.length - this.lastSent.length >= STREAM_UPDATE_CHARS) {
+      await this.flush(false, false);
+      return;
+    }
+
+    if (!this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        void this.flush(false, false).catch(() => {
+          // complete()/fail() await the same serialized chain and surface the
+          // delivery error through the normal message reliability path.
+        });
+      }, STREAM_UPDATE_INTERVAL_MS);
+    }
+  }
+
+  async complete(finalText: string): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearTimer();
+    this.content = finalText;
+    await this.flush(true, false);
+  }
+
+  async fail(_error?: unknown): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearTimer();
+    await this.flush(false, true);
+  }
+
+  private clearTimer(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private async flush(finalize: boolean, failed: boolean): Promise<void> {
+    const snapshot = this.content;
+    if (!finalize && !failed && snapshot === this.lastSent) return;
+    this.lastSent = snapshot;
+    const task = this.updateChain.then(() =>
+      this.update(snapshot, finalize, failed),
+    );
+    this.updateChain = task.catch(() => undefined);
+    await task;
+  }
+}
 
 /**
  * DingTalk Channel using Stream Mode SDK
@@ -41,16 +111,22 @@ export class DingTalkChannel implements Channel {
   private clientId: string;
   private clientSecret: string;
   private sessionWebhooks: SessionWebhookMap = new Map();
-  private pendingCommands: PendingCommandsMap = new Map();
+  private conversationTargets = new Map<string, DingTalkConversationTarget>();
+  private aiCardTemplateId: string;
+  private aiCardContentKey: string;
 
   constructor(
     clientId: string,
     clientSecret: string,
     opts: DingTalkChannelOpts,
+    aiCardTemplateId = '',
+    aiCardContentKey = 'content',
   ) {
     this.clientId = clientId;
     this.clientSecret = clientSecret;
     this.opts = opts;
+    this.aiCardTemplateId = aiCardTemplateId;
+    this.aiCardContentKey = aiCardContentKey || 'content';
   }
 
   async connect(): Promise<void> {
@@ -104,6 +180,10 @@ export class DingTalkChannel implements Channel {
     const timestamp = new Date(createAt).toISOString();
     const senderName = senderNick || senderStaffId;
     const isGroup = conversationType === 'group' || conversationType === '2';
+    this.conversationTargets.set(conversationId, {
+      isGroup,
+      senderStaffId,
+    });
 
     // Store chat metadata
     this.opts.onChatMetadata(
@@ -131,27 +211,34 @@ export class DingTalkChannel implements Channel {
         return;
       }
 
-      // /register command - show usage
-      if (content === '/register' || content === '！register') {
+      // Registration and main-group assignment are deliberately local-only.
+      // A chat message is untrusted input and must never grant filesystem or
+      // cross-group privileges.
+      if (
+        content === '/register' ||
+        content === '！register' ||
+        content.startsWith('/register ') ||
+        content.startsWith('！register ') ||
+        content === '/set-main' ||
+        content === '！设置主群' ||
+        content === '/set-main-confirm' ||
+        content === '！确认设置主群' ||
+        content === '/unset-main' ||
+        content === '！取消主群' ||
+        content === '/unset-main-confirm' ||
+        content === '！确认取消主群'
+      ) {
         if (group) {
           await this.sendMessage(
             chatJid,
-            `此群聊已注册！\n名称: ${group.name}\n文件夹: ${group.folder}\n触发器: ${group.trigger}`,
+            `此群聊已注册。\n名称: ${group.name}\n文件夹: ${group.folder}\n触发器: ${group.trigger}\n\n权限变更只能在 MedClaw 主机上通过本地 setup 执行。`,
           );
         } else {
-          await this.sendMessage(chatJid, this.getRegisterHelp());
+          await this.sendMessage(
+            chatJid,
+            this.getLocalRegistrationHelp(chatJid),
+          );
         }
-        return;
-      }
-
-      // /register command - parse and execute
-      if (
-        content.startsWith('/register ') ||
-        content.startsWith('！register ')
-      ) {
-        const isExclamation = content.startsWith('！');
-        const argsContent = content.substring(isExclamation ? 10 : 9).trim();
-        await this.handleRegisterCommand(chatJid, argsContent);
         return;
       }
 
@@ -169,118 +256,6 @@ export class DingTalkChannel implements Channel {
         'Message from unregistered DingTalk conversation',
       );
       return;
-    }
-
-    // Commands that require the group to be registered
-    if (msgtype === 'text' && text?.content) {
-      const content = text.content.trim();
-
-      // /set-main command - set current group as a main group
-      if (content === '/set-main' || content === '！设置主群') {
-        if (group.isMain) {
-          await this.sendMessage(
-            chatJid,
-            `此群已经是主群了。\n\n名称：${group.name}\n文件夹：${group.folder}`,
-          );
-        } else {
-          // Require explicit confirmation
-          await this.sendMessage(
-            chatJid,
-            `⚠️ 即将把此群设置为主群。\n\n主群特权：\n• 可以看到所有群的任务\n• 可以管理其他群组\n\n发送 /set-main-confirm 确认，或 /cancel 取消`,
-          );
-          // Store pending command in session (using timestamp as key)
-          this.pendingCommands.set(conversationId, {
-            type: 'set-main',
-            timestamp: Date.now(),
-          });
-        }
-        return;
-      }
-
-      // /set-main-confirm command
-      if (content === '/set-main-confirm' || content === '！确认设置主群') {
-        const pending = this.pendingCommands.get(conversationId);
-        if (
-          pending?.type === 'set-main' &&
-          Date.now() - pending.timestamp < 60000
-        ) {
-          setRegisteredGroup(chatJid, {
-            ...group,
-            isMain: true,
-          });
-          this.pendingCommands.delete(conversationId);
-          logger.info(
-            { chatJid, name: group.name },
-            'Group set as main via command',
-          );
-          await this.sendMessage(
-            chatJid,
-            `✅ 此群已设置为主群！\n\n名称：${group.name}\n文件夹：${group.folder}`,
-          );
-        } else {
-          await this.sendMessage(
-            chatJid,
-            `确认超时或没有待确认的操作。请重新发送 /set-main`,
-          );
-        }
-        return;
-      }
-
-      // /unset-main command - remove main group status
-      if (content === '/unset-main' || content === '！取消主群') {
-        if (!group.isMain) {
-          await this.sendMessage(chatJid, `此群不是主群。\n\n当前状态：普通群`);
-        } else {
-          await this.sendMessage(
-            chatJid,
-            `⚠️ 即将取消此群的主群状态。\n\n发送 /unset-main-confirm 确认，或 /cancel 取消`,
-          );
-          this.pendingCommands.set(conversationId, {
-            type: 'unset-main',
-            timestamp: Date.now(),
-          });
-        }
-        return;
-      }
-
-      // /unset-main-confirm command
-      if (content === '/unset-main-confirm' || content === '！确认取消主群') {
-        const pending = this.pendingCommands.get(conversationId);
-        if (
-          pending?.type === 'unset-main' &&
-          Date.now() - pending.timestamp < 60000
-        ) {
-          setRegisteredGroup(chatJid, {
-            ...group,
-            isMain: false,
-          });
-          this.pendingCommands.delete(conversationId);
-          logger.info(
-            { chatJid, name: group.name },
-            'Group unset as main via command',
-          );
-          await this.sendMessage(
-            chatJid,
-            `✅ 已取消主群状态！\n\n名称：${group.name}\n文件夹：${group.folder}`,
-          );
-        } else {
-          await this.sendMessage(
-            chatJid,
-            `确认超时或没有待确认的操作。请重新发送 /unset-main`,
-          );
-        }
-        return;
-      }
-
-      // /cancel command - cancel pending operation
-      if (content === '/cancel' || content === '！取消') {
-        const pending = this.pendingCommands.get(conversationId);
-        if (pending) {
-          this.pendingCommands.delete(conversationId);
-          await this.sendMessage(chatJid, `已取消操作：${pending.type}`);
-        }
-        return;
-      }
     }
 
     // Determine message content based on type
@@ -326,104 +301,13 @@ export class DingTalkChannel implements Channel {
     logger.info({ chatJid, sender: senderName }, 'DingTalk message received');
   }
 
-  private getRegisterHelp(): string {
-    return `请提供以下信息来注册此群聊：
+  private getLocalRegistrationHelp(chatJid: string): string {
+    return `为了安全，群聊不能通过消息自行注册或获取 main 权限。
 
-格式：/register 名称|文件夹|触发器
+请在 MedClaw 主机上使用本地 setup 注册此 Chat ID：
+${chatJid}
 
-示例：/register 我的群|my_group|@Andy
-
-说明：
-• 名称：群聊显示名称（中文或英文）
-• 文件夹：只能用字母、数字、下划线，不超过64字符
-• 触发器：如 @Andy 或 @机器人
-
-提示：发送 /chatid 查看当前群聊ID`;
-  }
-
-  private async handleRegisterCommand(
-    chatJid: string,
-    argsContent: string,
-  ): Promise<void> {
-    // Parse: name|folder|trigger
-    const parts = argsContent.split('|').map((s) => s.trim());
-    if (parts.length !== 3) {
-      await this.sendMessage(chatJid, `格式错误！${this.getRegisterHelp()}`);
-      return;
-    }
-
-    const [name, folder, trigger] = parts;
-
-    // Validate name
-    if (!name || name.length === 0) {
-      await this.sendMessage(chatJid, '错误：群聊名称不能为空');
-      return;
-    }
-
-    // Validate folder
-    if (!isValidGroupFolder(folder)) {
-      await this.sendMessage(
-        chatJid,
-        '错误：文件夹名无效。只能使用字母、数字、下划线，1-64字符，不能以特殊字符开头',
-      );
-      return;
-    }
-
-    // Validate trigger
-    if (!trigger || trigger.length === 0) {
-      await this.sendMessage(chatJid, '错误：触发器不能为空');
-      return;
-    }
-
-    // Check if folder already exists
-    const groupPath = resolveGroupFolderPath(folder);
-    if (fs.existsSync(groupPath)) {
-      await this.sendMessage(
-        chatJid,
-        `错误：文件夹 "${folder}" 已存在，请选择其他名称`,
-      );
-      return;
-    }
-
-    // Create group folder
-    try {
-      fs.mkdirSync(groupPath, { recursive: true });
-
-      // Create CLAUDE.md file
-      const ClaudeMdPath = path.join(groupPath, 'CLAUDE.md');
-      fs.writeFileSync(
-        ClaudeMdPath,
-        `# ${name}\n\nThis is a DingTalk group chat folder for "${name}".\n\nGroup: ${name}\nTrigger: ${trigger}\n`,
-        'utf-8',
-      );
-    } catch (err) {
-      logger.error({ folder, err }, 'Failed to create group folder');
-      await this.sendMessage(chatJid, `错误：创建文件夹失败`);
-      return;
-    }
-
-    // Register in database
-    try {
-      setRegisteredGroup(chatJid, {
-        name,
-        folder,
-        trigger,
-        added_at: new Date().toISOString(),
-        requiresTrigger: false,
-      });
-
-      logger.info(
-        { chatJid, name, folder, trigger },
-        'DingTalk group registered via /register command',
-      );
-      await this.sendMessage(
-        chatJid,
-        `✅ 注册成功！\n\n名称：${name}\n文件夹：${folder}\n\n现在可以直接发送消息，无需触发器！`,
-      );
-    } catch (err) {
-      logger.error({ chatJid, err }, 'Failed to register group in database');
-      await this.sendMessage(chatJid, `错误：数据库注册失败`);
-    }
+发送 /chatid 可再次查看 ID。`;
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -431,13 +315,15 @@ export class DingTalkChannel implements Channel {
     const sessionWebhook = this.sessionWebhooks.get(conversationId);
 
     if (!sessionWebhook) {
-      logger.warn({ jid }, 'No sessionWebhook stored for conversation');
-      return;
+      const error = new Error(`No sessionWebhook stored for ${jid}`);
+      logger.warn({ jid }, error.message);
+      throw error;
     }
 
     if (!this.client) {
-      logger.warn('DingTalk client not initialized');
-      return;
+      const error = new Error('DingTalk client not initialized');
+      logger.warn(error.message);
+      throw error;
     }
 
     try {
@@ -493,7 +379,87 @@ export class DingTalkChannel implements Channel {
       logger.info({ jid, length: text.length }, 'DingTalk message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send DingTalk message');
+      throw err;
     }
+  }
+
+  async startMessageStream(jid: string): Promise<StreamingMessage | null> {
+    // DingTalk requires an AI-card template imported into the same app. With
+    // no template configured, retain the normal one-message delivery path.
+    if (!this.aiCardTemplateId) return null;
+    if (!this.client) throw new Error('DingTalk client not initialized');
+
+    const conversationId = jid.replace(/^dingtalk:/, '');
+    const target = this.conversationTargets.get(conversationId);
+    if (!target) return null;
+
+    const accessToken = await this.client.getAccessToken();
+    const headers = {
+      'x-acs-dingtalk-access-token': accessToken,
+      'Content-Type': 'application/json',
+    };
+    const outTrackId = randomUUID();
+
+    await axios({
+      url: `${DINGTALK_API_BASE}/v1.0/card/instances`,
+      method: 'POST',
+      responseType: 'json',
+      data: {
+        cardTemplateId: this.aiCardTemplateId,
+        outTrackId,
+        cardData: {
+          cardParamMap: {
+            [this.aiCardContentKey]: '',
+            flowStatus: '1',
+          },
+        },
+        callbackType: 'STREAM',
+        imGroupOpenSpaceModel: { supportForward: true },
+        imRobotOpenSpaceModel: { supportForward: true },
+      },
+      headers,
+      timeout: 10000,
+    });
+
+    const deliverData: Record<string, unknown> = {
+      outTrackId,
+      userIdType: 1,
+    };
+    if (target.isGroup) {
+      deliverData.openSpaceId = `dtv1.card//IM_GROUP.${conversationId}`;
+      deliverData.imGroupOpenDeliverModel = { robotCode: this.clientId };
+    } else {
+      deliverData.openSpaceId = `dtv1.card//IM_ROBOT.${target.senderStaffId}`;
+      deliverData.imRobotOpenDeliverModel = { spaceType: 'IM_ROBOT' };
+    }
+
+    await axios({
+      url: `${DINGTALK_API_BASE}/v1.0/card/instances/deliver`,
+      method: 'POST',
+      responseType: 'json',
+      data: deliverData,
+      headers,
+      timeout: 10000,
+    });
+
+    return new DingTalkStreamingMessage(async (content, finalize, failed) => {
+      await axios({
+        url: `${DINGTALK_API_BASE}/v1.0/card/streaming`,
+        method: 'PUT',
+        responseType: 'json',
+        data: {
+          outTrackId,
+          guid: randomUUID(),
+          key: this.aiCardContentKey,
+          content,
+          isFull: true,
+          isFinalize: finalize,
+          isError: failed,
+        },
+        headers,
+        timeout: 10000,
+      });
+    });
   }
 
   isConnected(): boolean {
@@ -509,6 +475,7 @@ export class DingTalkChannel implements Channel {
       this.client.disconnect();
       this.client = null;
       this.sessionWebhooks.clear();
+      this.conversationTargets.clear();
       logger.info('DingTalk bot disconnected');
     }
   }
@@ -518,13 +485,26 @@ export class DingTalkChannel implements Channel {
   }
 }
 
-// Self-registration
+// Channel-factory registration (chat privilege registration remains local-only)
 registerChannel('dingtalk', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['DINGTALK_CLIENT_ID', 'DINGTALK_CLIENT_SECRET']);
+  const envVars = readEnvFile([
+    'DINGTALK_CLIENT_ID',
+    'DINGTALK_CLIENT_SECRET',
+    'DINGTALK_AI_CARD_TEMPLATE_ID',
+    'DINGTALK_AI_CARD_CONTENT_KEY',
+  ]);
   const clientId =
     process.env.DINGTALK_CLIENT_ID || envVars.DINGTALK_CLIENT_ID || '';
   const clientSecret =
     process.env.DINGTALK_CLIENT_SECRET || envVars.DINGTALK_CLIENT_SECRET || '';
+  const aiCardTemplateId =
+    process.env.DINGTALK_AI_CARD_TEMPLATE_ID ||
+    envVars.DINGTALK_AI_CARD_TEMPLATE_ID ||
+    '';
+  const aiCardContentKey =
+    process.env.DINGTALK_AI_CARD_CONTENT_KEY ||
+    envVars.DINGTALK_AI_CARD_CONTENT_KEY ||
+    'content';
 
   if (!clientId || !clientSecret) {
     logger.debug(
@@ -533,5 +513,11 @@ registerChannel('dingtalk', (opts: ChannelOpts) => {
     return null;
   }
 
-  return new DingTalkChannel(clientId, clientSecret, opts);
+  return new DingTalkChannel(
+    clientId,
+    clientSecret,
+    opts,
+    aiCardTemplateId,
+    aiCardContentKey,
+  );
 });

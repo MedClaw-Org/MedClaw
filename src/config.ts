@@ -63,6 +63,16 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+/** Match the literal trigger configured for a specific group. */
+export function matchesTrigger(content: string, trigger: string): boolean {
+  const normalizedTrigger = trigger.trim();
+  if (!normalizedTrigger) return false;
+  return new RegExp(
+    `^${escapeRegex(normalizedTrigger)}(?=$|\\s|[\\p{P}\\p{S}])`,
+    'iu',
+  ).test(content.trim());
+}
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

@@ -119,6 +119,23 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Repair legacy databases that contain more than one main group, then make
+  // the invariant enforceable at the database boundary.
+  database.exec(`
+    UPDATE registered_groups
+    SET is_main = 0
+    WHERE is_main = 1
+      AND jid NOT IN (
+        SELECT jid
+        FROM registered_groups
+        WHERE is_main = 1
+        ORDER BY CASE WHEN folder = 'main' THEN 0 ELSE 1 END, added_at, jid
+        LIMIT 1
+      );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_single_main_group
+      ON registered_groups(is_main) WHERE is_main = 1;
+  `);
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
@@ -262,7 +279,15 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id, chat_jid) DO UPDATE SET
+       sender = excluded.sender,
+       sender_name = excluded.sender_name,
+       content = excluded.content,
+       timestamp = excluded.timestamp,
+       is_from_me = excluded.is_from_me,
+       is_bot_message = excluded.is_bot_message`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -289,7 +314,15 @@ export function storeMessageDirect(msg: {
   is_bot_message?: boolean;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id, chat_jid) DO UPDATE SET
+       sender = excluded.sender,
+       sender_name = excluded.sender_name,
+       content = excluded.content,
+       timestamp = excluded.timestamp,
+       is_from_me = excluded.is_from_me,
+       is_bot_message = excluded.is_bot_message`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -302,55 +335,139 @@ export function storeMessageDirect(msg: {
   );
 }
 
+export interface StoredMessage extends NewMessage {
+  /** Monotonic SQLite insertion sequence used for lossless message cursors. */
+  ingest_seq: number;
+}
+
+/**
+ * Convert a legacy timestamp cursor to the corresponding insertion sequence.
+ * New code persists sequences directly; this is retained for seamless upgrades.
+ */
+export function getMessageSequenceAtOrBefore(
+  timestamp: string,
+  chatJid?: string,
+): number {
+  if (!timestamp) return 0;
+  const row = chatJid
+    ? (db
+        .prepare(
+          'SELECT COALESCE(MAX(rowid), 0) AS seq FROM messages WHERE chat_jid = ? AND timestamp <= ?',
+        )
+        .get(chatJid, timestamp) as { seq: number })
+    : (db
+        .prepare(
+          'SELECT COALESCE(MAX(rowid), 0) AS seq FROM messages WHERE timestamp <= ?',
+        )
+        .get(timestamp) as { seq: number });
+  return row.seq;
+}
+
+/** Sequence strictly before a timestamp, used to migrate lossy old cursors. */
+export function getMessageSequenceBefore(
+  timestamp: string,
+  chatJid?: string,
+): number {
+  if (!timestamp) return 0;
+  const row = chatJid
+    ? (db
+        .prepare(
+          'SELECT COALESCE(MAX(rowid), 0) AS seq FROM messages WHERE chat_jid = ? AND timestamp < ?',
+        )
+        .get(chatJid, timestamp) as { seq: number })
+    : (db
+        .prepare(
+          'SELECT COALESCE(MAX(rowid), 0) AS seq FROM messages WHERE timestamp < ?',
+        )
+        .get(timestamp) as { seq: number });
+  return row.seq;
+}
+
+function sequenceForLegacyTimestamp(timestamp: string, jids: string[]): number {
+  if (!timestamp || jids.length === 0) return 0;
+  const placeholders = jids.map(() => '?').join(',');
+  const row = db
+    .prepare(
+      `SELECT COALESCE(MAX(rowid), 0) AS seq
+       FROM messages
+       WHERE timestamp <= ? AND chat_jid IN (${placeholders})`,
+    )
+    .get(timestamp, ...jids) as { seq: number };
+  return row.seq;
+}
+
 export function getNewMessages(
   jids: string[],
-  lastTimestamp: string,
+  cursor: number | string,
   botPrefix: string,
-): { messages: NewMessage[]; newTimestamp: string } {
-  if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
+): { messages: StoredMessage[]; newSeq: number; newTimestamp: string } {
+  if (jids.length === 0) {
+    return {
+      messages: [],
+      newSeq: typeof cursor === 'number' ? cursor : 0,
+      newTimestamp: typeof cursor === 'string' ? cursor : '',
+    };
+  }
 
   const placeholders = jids.map(() => '?').join(',');
+  const lastSeq =
+    typeof cursor === 'number'
+      ? cursor
+      : sequenceForLegacyTimestamp(cursor, jids);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    SELECT rowid AS ingest_seq, id, chat_jid, sender, sender_name, content, timestamp, is_from_me
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
+    WHERE rowid > ? AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    ORDER BY rowid
   `;
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+    .all(lastSeq, ...jids, `${botPrefix}:%`) as StoredMessage[];
 
-  let newTimestamp = lastTimestamp;
+  const cursorRow = db
+    .prepare(
+      `SELECT COALESCE(MAX(rowid), ?) AS seq
+       FROM messages
+       WHERE chat_jid IN (${placeholders})`,
+    )
+    .get(lastSeq, ...jids) as { seq: number };
+  const newSeq = Math.max(lastSeq, cursorRow.seq);
+
+  let newTimestamp = typeof cursor === 'string' ? cursor : '';
   for (const row of rows) {
     if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
   }
 
-  return { messages: rows, newTimestamp };
+  return { messages: rows, newSeq, newTimestamp };
 }
 
 export function getMessagesSince(
   chatJid: string,
-  sinceTimestamp: string,
+  cursor: number | string,
   botPrefix: string,
-): NewMessage[] {
+): StoredMessage[] {
+  const sinceSeq =
+    typeof cursor === 'number'
+      ? cursor
+      : getMessageSequenceAtOrBefore(cursor, chatJid);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    SELECT rowid AS ingest_seq, id, chat_jid, sender, sender_name, content, timestamp, is_from_me
     FROM messages
-    WHERE chat_jid = ? AND timestamp > ?
+    WHERE chat_jid = ? AND rowid > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+    ORDER BY rowid
   `;
   return db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+    .all(chatJid, sinceSeq, `${botPrefix}:%`) as StoredMessage[];
 }
 
 export function createTask(
@@ -574,8 +691,16 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(jid) DO UPDATE SET
+       name = excluded.name,
+       folder = excluded.folder,
+       trigger_pattern = excluded.trigger_pattern,
+       added_at = excluded.added_at,
+       container_config = excluded.container_config,
+       requires_trigger = excluded.requires_trigger,
+       is_main = excluded.is_main`,
   ).run(
     jid,
     group.name,

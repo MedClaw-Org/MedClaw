@@ -1,7 +1,8 @@
 /**
  * Step: register — Write channel registration config, create group folders.
  *
- * Accepts --channel to specify the messaging platform (whatsapp, telegram, slack, discord).
+ * Accepts --channel to label the messaging platform (for example dingtalk,
+ * feishu, qq, whatsapp, telegram, slack, or discord).
  * Uses parameterized SQL queries to prevent injection.
  */
 import fs from 'fs';
@@ -115,22 +116,51 @@ export async function run(args: string[]): Promise<void> {
     requires_trigger INTEGER DEFAULT 1,
     is_main INTEGER DEFAULT 0
   )`);
+  db.exec(`
+    UPDATE registered_groups
+    SET is_main = 0
+    WHERE is_main = 1
+      AND jid NOT IN (
+        SELECT jid FROM registered_groups
+        WHERE is_main = 1
+        ORDER BY CASE WHEN folder = 'main' THEN 0 ELSE 1 END, added_at, jid
+        LIMIT 1
+      );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_single_main_group
+      ON registered_groups(is_main) WHERE is_main = 1;
+  `);
 
   const isMainInt = parsed.isMain ? 1 : 0;
 
-  db.prepare(
-    `INSERT OR REPLACE INTO registered_groups
-     (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
-  ).run(
-    parsed.jid,
-    parsed.name,
-    parsed.folder,
-    parsed.trigger,
-    timestamp,
-    requiresTriggerInt,
-    isMainInt,
-  );
+  const registerGroup = db.transaction(() => {
+    // Main privileges are assigned only from this local setup step. Keep the
+    // database invariant explicit: there is at most one main group.
+    if (parsed.isMain) {
+      db.prepare('UPDATE registered_groups SET is_main = 0').run();
+    }
+    db.prepare(
+      `INSERT INTO registered_groups
+       (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+       ON CONFLICT(jid) DO UPDATE SET
+         name = excluded.name,
+         folder = excluded.folder,
+         trigger_pattern = excluded.trigger_pattern,
+         added_at = excluded.added_at,
+         container_config = excluded.container_config,
+         requires_trigger = excluded.requires_trigger,
+         is_main = excluded.is_main`,
+    ).run(
+      parsed.jid,
+      parsed.name,
+      parsed.folder,
+      parsed.trigger,
+      timestamp,
+      requiresTriggerInt,
+      isMainInt,
+    );
+  });
+  registerGroup();
 
   db.close();
   logger.info('Wrote registration to SQLite');
@@ -193,6 +223,7 @@ export async function run(args: string[]): Promise<void> {
     CHANNEL: parsed.channel,
     TRIGGER: parsed.trigger,
     REQUIRES_TRIGGER: parsed.requiresTrigger,
+    IS_MAIN: parsed.isMain,
     ASSISTANT_NAME: parsed.assistantName,
     NAME_UPDATED: nameUpdated,
     STATUS: 'success',

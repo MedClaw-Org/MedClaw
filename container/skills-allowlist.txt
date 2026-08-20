@@ -1,0 +1,11 @@
+# Bundled skills reviewed for default MedClaw sessions.
+# A catalog directory is not executable approval; add entries deliberately.
+agent-browser
+pubmed-search
+medical-research-toolkit
+medical-specialty-briefs
+usmle
+medical-entity-extractor
+patiently-ai
+multi-search-engine
+wikipedia-search

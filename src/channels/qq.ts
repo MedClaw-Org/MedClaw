@@ -1,7 +1,7 @@
 import axios from 'axios';
 import WebSocket from 'ws';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, matchesTrigger } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { ChannelOpts, registerChannel } from './registry.js';
@@ -255,12 +255,6 @@ export class QQBotChannel implements Channel {
 
     this.opts.onChatMetadata(chatJid, timestamp, groupOpenId, 'qq', true);
 
-    // Remove @bot prefix if present, add TRIGGER_PATTERN if needed
-    let text = content.replace(/^@\S+\s*/, '').trim();
-    if (!TRIGGER_PATTERN.test(text)) {
-      text = `@${ASSISTANT_NAME} ${text}`;
-    }
-
     let group = this.opts.registeredGroups()[chatJid];
     if (!group) {
       if (!this.opts.registerGroup) {
@@ -271,12 +265,19 @@ export class QQBotChannel implements Channel {
       group = {
         name: `QQ Group ${groupOpenId.slice(0, 8)}`,
         folder,
-        trigger: ASSISTANT_NAME,
+        trigger: `@${ASSISTANT_NAME}`,
         added_at: timestamp,
         requiresTrigger: true,
       };
       this.opts.registerGroup(chatJid, group);
       logger.info({ chatJid, folder }, 'QQ group auto-registered');
+    }
+
+    // QQ group events are always bot mentions. Normalize the platform mention
+    // to the literal trigger configured for this group.
+    let text = content.replace(/^@\S+\s*/, '').trim();
+    if (!matchesTrigger(text, group.trigger)) {
+      text = `${group.trigger} ${text}`;
     }
 
     this.opts.onMessage(chatJid, {
@@ -307,11 +308,6 @@ export class QQBotChannel implements Channel {
 
     this.opts.onChatMetadata(chatJid, timestamp, userOpenId, 'qq', false);
 
-    let text = content.trim();
-    if (!TRIGGER_PATTERN.test(text)) {
-      text = `@${ASSISTANT_NAME} ${text}`;
-    }
-
     let group = this.opts.registeredGroups()[chatJid];
     if (!group) {
       if (!this.opts.registerGroup) {
@@ -322,12 +318,17 @@ export class QQBotChannel implements Channel {
       group = {
         name: `QQ User ${userOpenId.slice(0, 8)}`,
         folder,
-        trigger: ASSISTANT_NAME,
+        trigger: `@${ASSISTANT_NAME}`,
         added_at: timestamp,
         requiresTrigger: false,
       };
       this.opts.registerGroup(chatJid, group);
       logger.info({ chatJid, folder }, 'QQ C2C auto-registered');
+    }
+
+    let text = content.trim();
+    if (!matchesTrigger(text, group.trigger)) {
+      text = `${group.trigger} ${text}`;
     }
 
     this.opts.onMessage(chatJid, {
@@ -377,8 +378,7 @@ export class QQBotChannel implements Channel {
         const userOpenId = jid.replace('qq:user:', '');
         url = `${API_BASE}/v2/users/${userOpenId}/messages`;
       } else {
-        logger.warn({ jid }, 'QQ sendMessage: unknown JID format');
-        return;
+        throw new Error(`QQ sendMessage: unknown JID format: ${jid}`);
       }
 
       await axios.post(url, body, {
@@ -391,6 +391,7 @@ export class QQBotChannel implements Channel {
         { jid, err: err?.response?.data || err?.message },
         'Failed to send QQ message',
       );
+      throw err;
     }
   }
 
