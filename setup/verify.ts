@@ -108,6 +108,13 @@ export async function run(_args: string[]): Promise<void> {
 
   // 4. Check channel auth (detect configured channels by credentials)
   const envVars = readEnvFile([
+    'DINGTALK_CLIENT_ID',
+    'DINGTALK_CLIENT_SECRET',
+    'DINGTALK_AI_CARD_TEMPLATE_ID',
+    'FEISHU_APP_ID',
+    'FEISHU_APP_SECRET',
+    'QQ_BOT_APP_ID',
+    'QQ_BOT_APP_SECRET',
     'TELEGRAM_BOT_TOKEN',
     'SLACK_BOT_TOKEN',
     'SLACK_APP_TOKEN',
@@ -116,6 +123,22 @@ export async function run(_args: string[]): Promise<void> {
 
   const channelAuth: Record<string, string> = {};
 
+  const configured = (key: string): string | undefined =>
+    process.env[key] || envVars[key];
+
+  if (
+    configured('DINGTALK_CLIENT_ID') &&
+    configured('DINGTALK_CLIENT_SECRET')
+  ) {
+    channelAuth.dingtalk = 'configured';
+  }
+  if (configured('FEISHU_APP_ID') && configured('FEISHU_APP_SECRET')) {
+    channelAuth.feishu = 'configured';
+  }
+  if (configured('QQ_BOT_APP_ID') && configured('QQ_BOT_APP_SECRET')) {
+    channelAuth.qq = 'configured';
+  }
+
   // WhatsApp: check for auth credentials on disk
   const authDir = path.join(projectRoot, 'store', 'auth');
   if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) {
@@ -123,21 +146,24 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   // Token-based channels: check .env
-  if (process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN) {
+  if (configured('TELEGRAM_BOT_TOKEN')) {
     channelAuth.telegram = 'configured';
   }
-  if (
-    (process.env.SLACK_BOT_TOKEN || envVars.SLACK_BOT_TOKEN) &&
-    (process.env.SLACK_APP_TOKEN || envVars.SLACK_APP_TOKEN)
-  ) {
+  if (configured('SLACK_BOT_TOKEN') && configured('SLACK_APP_TOKEN')) {
     channelAuth.slack = 'configured';
   }
-  if (process.env.DISCORD_BOT_TOKEN || envVars.DISCORD_BOT_TOKEN) {
+  if (configured('DISCORD_BOT_TOKEN')) {
     channelAuth.discord = 'configured';
   }
 
   const configuredChannels = Object.keys(channelAuth);
   const anyChannelConfigured = configuredChannels.length > 0;
+  const streamingChannels = [
+    channelAuth.feishu ? 'feishu' : null,
+    channelAuth.dingtalk && configured('DINGTALK_AI_CARD_TEMPLATE_ID')
+      ? 'dingtalk'
+      : null,
+  ].filter((value): value is string => value !== null);
 
   // 5. Check registered groups (using better-sqlite3, not sqlite3 CLI)
   let registeredGroups = 0;
@@ -181,6 +207,7 @@ export async function run(_args: string[]): Promise<void> {
     CONTAINER_RUNTIME: containerRuntime,
     CREDENTIALS: credentials,
     CONFIGURED_CHANNELS: configuredChannels.join(','),
+    STREAMING_CHANNELS: streamingChannels.join(','),
     CHANNEL_AUTH: JSON.stringify(channelAuth),
     REGISTERED_GROUPS: registeredGroups,
     MOUNT_ALLOWLIST: mountAllowlist,

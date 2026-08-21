@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const loggerRef = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+vi.mock('./logger.js', () => ({ logger: loggerRef }));
 
 import {
   _initTestDatabase,
@@ -38,6 +46,7 @@ let groups: Record<string, RegisteredGroup>;
 let deps: IpcDeps;
 
 beforeEach(() => {
+  vi.clearAllMocks();
   _initTestDatabase();
 
   groups = {
@@ -108,10 +117,11 @@ describe('schedule_task authorization', () => {
   });
 
   it('non-main group cannot schedule for another group', async () => {
+    const promptCanary = 'PROMPT_CANARY_UNAUTHORIZED';
     await processTaskIpc(
       {
         type: 'schedule_task',
-        prompt: 'unauthorized',
+        prompt: promptCanary,
         schedule_type: 'once',
         schedule_value: '2025-06-01T00:00:00.000Z',
         targetJid: 'main@g.us',
@@ -123,6 +133,22 @@ describe('schedule_task authorization', () => {
 
     const allTasks = getAllTasks();
     expect(allTasks.length).toBe(0);
+    expect(loggerRef.warn).toHaveBeenCalledWith(
+      {
+        event: 'security_boundary_denied',
+        boundary: 'ipc_authorization',
+        channel: 'internal',
+        group_class: 'non_main',
+        reason_code: 'cross_group_task',
+      },
+      'Security boundary denied',
+    );
+    expect(JSON.stringify(loggerRef.warn.mock.calls)).not.toContain(
+      promptCanary,
+    );
+    expect(JSON.stringify(loggerRef.warn.mock.calls)).not.toContain(
+      'main@g.us',
+    );
   });
 
   it('rejects schedule_task for unregistered target JID', async () => {

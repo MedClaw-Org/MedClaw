@@ -1,24 +1,16 @@
 #!/usr/bin/env tsx
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
+import { createRequire } from 'module';
 import path from 'path';
 
 import { compareSemver } from '../skills-engine/state.js';
 
-// Resolve tsx binary once to avoid npx race conditions across migrations
-function resolveTsx(): string {
-  // Check local node_modules first
-  const local = path.resolve('node_modules/.bin/tsx');
-  if (fs.existsSync(local)) return local;
-  // Fall back to whichever tsx is in PATH
-  try {
-    return execSync('which tsx', { encoding: 'utf-8' }).trim();
-  } catch {
-    return 'npx'; // last resort
-  }
-}
-
-const tsxBin = resolveTsx();
+// The tsx CLI opens an IPC socket. That fails in restricted runtimes even though
+// Node is otherwise allowed to execute the migration. Loading tsx through Node's
+// --import hook provides the same TypeScript support without an IPC server.
+const require = createRequire(import.meta.url);
+const tsxLoader = require.resolve('tsx');
 
 const fromVersion = process.argv[2];
 const toVersion = process.argv[3];
@@ -72,14 +64,15 @@ for (const version of migrationVersions) {
   }
 
   try {
-    const tsxArgs = tsxBin.endsWith('npx')
-      ? ['tsx', migrationIndex, projectRoot]
-      : [migrationIndex, projectRoot];
-    execFileSync(tsxBin, tsxArgs, {
-      stdio: 'pipe',
-      cwd: projectRoot,
-      timeout: 120_000,
-    });
+    execFileSync(
+      process.execPath,
+      ['--import', tsxLoader, migrationIndex, projectRoot],
+      {
+        stdio: 'pipe',
+        cwd: projectRoot,
+        timeout: 120_000,
+      },
+    );
     results.push({ version, success: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

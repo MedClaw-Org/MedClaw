@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from './config.js';
+import { ASSISTANT_NAME, matchesTrigger, TRIGGER_PATTERN } from './config.js';
 import {
   escapeXml,
   formatMessages,
@@ -139,6 +139,22 @@ describe('TRIGGER_PATTERN', () => {
   it('matches with leading whitespace after trim', () => {
     // The actual usage trims before testing: TRIGGER_PATTERN.test(m.content.trim())
     expect(TRIGGER_PATTERN.test(`@${name} hey`.trim())).toBe(true);
+  });
+});
+
+describe('matchesTrigger', () => {
+  it('uses the trigger configured for the group', () => {
+    expect(matchesTrigger('@Medic help', '@Medic')).toBe(true);
+    expect(matchesTrigger('@Andy help', '@Medic')).toBe(false);
+  });
+
+  it('treats configured trigger text literally', () => {
+    expect(matchesTrigger('[doctor] help', '[doctor]')).toBe(true);
+    expect(matchesTrigger('doctor help', '[doctor]')).toBe(false);
+  });
+
+  it('does not match a longer identifier with the same prefix', () => {
+    expect(matchesTrigger('@MedicExtra help', '@Medic')).toBe(false);
   });
 });
 

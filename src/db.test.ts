@@ -138,6 +138,32 @@ describe('storeMessage', () => {
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
   });
+
+  it('preserves the ingestion sequence when a duplicate is updated', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    store({
+      id: 'stable-seq',
+      chat_jid: 'group@g.us',
+      sender: 'user',
+      sender_name: 'User',
+      content: 'original',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    const [original] = getMessagesSince('group@g.us', 0, 'Andy');
+
+    store({
+      id: 'stable-seq',
+      chat_jid: 'group@g.us',
+      sender: 'user',
+      sender_name: 'User',
+      content: 'updated',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+
+    expect(getMessagesSince('group@g.us', original.ingest_seq, 'Andy')).toEqual(
+      [],
+    );
+  });
 });
 
 // --- getMessagesSince ---
@@ -225,6 +251,22 @@ describe('getMessagesSince', () => {
     );
     expect(msgs).toHaveLength(0);
   });
+
+  it('does not lose a later-ingested message with the same timestamp', () => {
+    const initial = getMessagesSince('group@g.us', 0, 'Andy');
+    const cursor = initial[initial.length - 1].ingest_seq;
+    store({
+      id: 'same-time-later',
+      chat_jid: 'group@g.us',
+      sender: 'Late@s.whatsapp.net',
+      sender_name: 'Late',
+      content: 'same timestamp but later arrival',
+      timestamp: '2024-01-01T00:00:04.000Z',
+    });
+
+    const msgs = getMessagesSince('group@g.us', cursor, 'Andy');
+    expect(msgs.map((message) => message.id)).toEqual(['same-time-later']);
+  });
 });
 
 // --- getNewMessages ---
@@ -295,6 +337,26 @@ describe('getNewMessages', () => {
     const { messages, newTimestamp } = getNewMessages([], '', 'Andy');
     expect(messages).toHaveLength(0);
     expect(newTimestamp).toBe('');
+  });
+
+  it('uses insertion order so equal timestamps are not skipped', () => {
+    const first = getNewMessages(['group1@g.us', 'group2@g.us'], 0, 'Andy');
+    store({
+      id: 'a5',
+      chat_jid: 'group1@g.us',
+      sender: 'late-user',
+      sender_name: 'Late User',
+      content: 'late arrival',
+      timestamp: '2024-01-01T00:00:04.000Z',
+    });
+
+    const second = getNewMessages(
+      ['group1@g.us', 'group2@g.us'],
+      first.newSeq,
+      'Andy',
+    );
+    expect(second.messages.map((message) => message.id)).toEqual(['a5']);
+    expect(second.newSeq).toBeGreaterThan(first.newSeq);
   });
 });
 
@@ -422,5 +484,25 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+
+  it('rejects a second main group at the database boundary', () => {
+    setRegisteredGroup('first@g.us', {
+      name: 'First Main',
+      folder: 'first-main',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+
+    expect(() =>
+      setRegisteredGroup('second@g.us', {
+        name: 'Second Main',
+        folder: 'second-main',
+        trigger: '@Andy',
+        added_at: '2024-01-02T00:00:00.000Z',
+        isMain: true,
+      }),
+    ).toThrow();
   });
 });

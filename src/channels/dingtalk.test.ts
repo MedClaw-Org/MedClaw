@@ -1,4 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+const axiosRef = vi.hoisted(() => ({
+  request: vi.fn(async (_request: any) => ({ data: {} })),
+}));
+
+const loggerRef = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock('axios', () => ({ default: axiosRef.request }));
+vi.mock('../logger.js', () => ({ logger: loggerRef }));
+
 import { DingTalkChannel } from './dingtalk.js';
 
 describe('DingTalkChannel', () => {
@@ -10,6 +25,11 @@ describe('DingTalkChannel', () => {
 
   const clientId = 'test-client-id';
   const clientSecret = 'test-client-secret';
+
+  beforeEach(() => {
+    axiosRef.request.mockClear();
+    vi.clearAllMocks();
+  });
 
   describe('constructor', () => {
     it('should create a channel with correct name', () => {
@@ -86,16 +106,206 @@ describe('DingTalkChannel', () => {
   });
 
   describe('sendMessage', () => {
-    it('should do nothing if no sessionWebhook stored', async () => {
+    it('rejects if no sessionWebhook is stored', async () => {
       const channel = new DingTalkChannel(clientId, clientSecret, mockOpts);
-      await channel.sendMessage('dingtalk:unknown', 'test message');
-      expect(mockOpts.onMessage).not.toHaveBeenCalled();
+      await expect(
+        channel.sendMessage('dingtalk:unknown', 'test message'),
+      ).rejects.toThrow('No sessionWebhook');
     });
 
-    it('should do nothing if client not initialized', async () => {
+    it('rejects if the client is not initialized', async () => {
       const channel = new DingTalkChannel(clientId, clientSecret, mockOpts);
       channel['sessionWebhooks'].set('conv1', 'webhook1');
-      await channel.sendMessage('dingtalk:conv1', 'test message');
+      await expect(
+        channel.sendMessage('dingtalk:conv1', 'test message'),
+      ).rejects.toThrow('not initialized');
+    });
+  });
+
+  describe('message streaming', () => {
+    const incomingMessage = {
+      conversationId: 'conv-stream',
+      conversationType: '2',
+      senderStaffId: 'user-1',
+      senderNick: 'Alice',
+      sessionWebhook: 'https://example.invalid/webhook',
+      msgtype: 'text',
+      text: { content: '@Andy stream this' },
+      msgId: 'msg-stream',
+      createAt: Date.now(),
+    } as any;
+
+    it('falls back to a normal final message when no card template is configured', async () => {
+      const channel = new DingTalkChannel(clientId, clientSecret, mockOpts);
+      channel['client'] = { getAccessToken: vi.fn() } as any;
+      channel['conversationTargets'].set('conv-stream', {
+        isGroup: true,
+        senderStaffId: 'user-1',
+      });
+
+      await expect(
+        channel.startMessageStream('dingtalk:conv-stream'),
+      ).resolves.toBeNull();
+      expect(axiosRef.request).not.toHaveBeenCalled();
+    });
+
+    it('creates, updates and finalizes one DingTalk AI card', async () => {
+      const opts = {
+        ...mockOpts,
+        registeredGroups: () => ({
+          'dingtalk:conv-stream': {
+            name: 'Stream group',
+            folder: 'stream-group',
+            trigger: '@Andy',
+            added_at: new Date().toISOString(),
+          },
+        }),
+      };
+      const channel = new DingTalkChannel(
+        clientId,
+        clientSecret,
+        opts,
+        'template.schema',
+        'content',
+      );
+      channel['client'] = {
+        getAccessToken: vi.fn(async () => 'access-token'),
+      } as any;
+      await channel['handleRobotMessage'](incomingMessage);
+
+      const stream = await channel.startMessageStream('dingtalk:conv-stream');
+      expect(stream).not.toBeNull();
+      await stream!.append('a'.repeat(60));
+      await stream!.complete('Canonical final answer');
+
+      const calls = axiosRef.request.mock.calls.map(([request]) => request);
+      expect(calls[0]).toMatchObject({
+        method: 'POST',
+        url: 'https://api.dingtalk.com/v1.0/card/instances',
+        data: {
+          cardTemplateId: 'template.schema',
+          cardData: {
+            cardParamMap: { content: '', flowStatus: '1' },
+          },
+        },
+      });
+      expect(calls[1]).toMatchObject({
+        method: 'POST',
+        url: 'https://api.dingtalk.com/v1.0/card/instances/deliver',
+        data: {
+          openSpaceId: 'dtv1.card//IM_GROUP.conv-stream',
+          imGroupOpenDeliverModel: { robotCode: clientId },
+        },
+      });
+      expect(calls.at(-1)).toMatchObject({
+        method: 'PUT',
+        url: 'https://api.dingtalk.com/v1.0/card/streaming',
+        data: {
+          key: 'content',
+          content: 'Canonical final answer',
+          isFull: true,
+          isFinalize: true,
+          isError: false,
+        },
+      });
+    });
+
+    it('marks an interrupted AI card as failed', async () => {
+      const channel = new DingTalkChannel(
+        clientId,
+        clientSecret,
+        mockOpts,
+        'template.schema',
+      );
+      channel['client'] = {
+        getAccessToken: vi.fn(async () => 'access-token'),
+      } as any;
+      channel['conversationTargets'].set('conv-stream', {
+        isGroup: true,
+        senderStaffId: 'user-1',
+      });
+
+      const stream = await channel.startMessageStream('dingtalk:conv-stream');
+      await stream!.append('partial');
+      await stream!.fail(new Error('model failed'));
+
+      expect(axiosRef.request.mock.calls.at(-1)?.[0]).toMatchObject({
+        method: 'PUT',
+        data: { isFinalize: false, isError: true },
+      });
+    });
+  });
+
+  describe('privileged commands', () => {
+    const robotMessage = (content: string) =>
+      ({
+        conversationId: 'conv-security',
+        conversationType: '2',
+        senderStaffId: 'untrusted-user',
+        senderNick: 'Mallory',
+        sessionWebhook: 'https://example.invalid/webhook',
+        msgtype: 'text',
+        text: { content },
+        msgId: `msg-${content}`,
+        createAt: Date.now(),
+      }) as any;
+
+    it('does not allow an unregistered chat to self-register', async () => {
+      const opts = {
+        ...mockOpts,
+        onMessage: vi.fn(),
+        registeredGroups: () => ({}),
+      };
+      const channel = new DingTalkChannel(clientId, clientSecret, opts);
+      const send = vi.spyOn(channel, 'sendMessage').mockResolvedValue();
+
+      await channel['handleRobotMessage'](
+        robotMessage('/register Owned|owned|@Andy'),
+      );
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledWith(
+        'dingtalk:conv-security',
+        expect.stringContaining('请在 MedClaw 主机上'),
+      );
+      expect(loggerRef.warn).toHaveBeenCalledWith(
+        {
+          event: 'security_boundary_denied',
+          boundary: 'channel_registration',
+          channel: 'dingtalk',
+          group_class: 'group',
+          reason_code: 'remote_privilege_command',
+        },
+        'Security boundary denied',
+      );
+      expect(JSON.stringify(loggerRef.warn.mock.calls)).not.toContain(
+        'Mallory',
+      );
+    });
+
+    it('does not allow a registered chat to grant itself main access', async () => {
+      const opts = {
+        ...mockOpts,
+        onMessage: vi.fn(),
+        registeredGroups: () => ({
+          'dingtalk:conv-security': {
+            name: 'Normal group',
+            folder: 'normal',
+            trigger: '@Andy',
+            added_at: new Date().toISOString(),
+          },
+        }),
+      };
+      const channel = new DingTalkChannel(clientId, clientSecret, opts);
+      const send = vi.spyOn(channel, 'sendMessage').mockResolvedValue();
+
+      await channel['handleRobotMessage'](robotMessage('/set-main-confirm'));
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledWith(
+        'dingtalk:conv-security',
+        expect.stringContaining('权限变更只能'),
+      );
     });
   });
 });

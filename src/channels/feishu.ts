@@ -1,14 +1,16 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, matchesTrigger } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { logSecurityBoundaryDenied } from '../security-events.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
+  StreamingMessage,
 } from '../types.js';
 
 /**
@@ -36,6 +38,7 @@ export class FeishuChannel implements Channel {
   name = 'feishu';
 
   private client: Lark.Client;
+  private outboundChannel: Lark.LarkChannel;
   private wsClient: Lark.WSClient | null = null;
   private opts: FeishuChannelOpts;
   private botOpenId: string = '';
@@ -46,6 +49,20 @@ export class FeishuChannel implements Channel {
 
   constructor(appId: string, appSecret: string, opts: FeishuChannelOpts) {
     this.client = new Lark.Client({ appId, appSecret });
+    // The higher-level outbound adapter shares the same official SDK but owns
+    // Feishu's CardKit streaming controller (throttling, ordered sequences,
+    // long-message rollover and terminal cleanup). It does not open another
+    // WebSocket; inbound traffic continues through wsClient below.
+    this.outboundChannel = new Lark.LarkChannel({
+      appId,
+      appSecret,
+      loggerLevel: Lark.LoggerLevel.warn,
+      outbound: {
+        streamInitialText: '…',
+        streamThrottleMs: 100,
+        streamThrottleChars: 24,
+      },
+    });
     this.opts = opts;
   }
 
@@ -127,6 +144,8 @@ export class FeishuChannel implements Channel {
 
     // Build content from message type
     let content = this.extractContent(msgType, rawContent, mentions);
+    const group = this.opts.registeredGroups()[chatJid];
+    const configuredTrigger = group?.trigger || `@${ASSISTANT_NAME}`;
 
     // Check for /chatid and /ping commands (text messages starting with /)
     if (msgType === 'text' && content.startsWith('/')) {
@@ -144,13 +163,13 @@ export class FeishuChannel implements Channel {
       }
     }
 
-    // Translate @bot mentions into TRIGGER_PATTERN format
+    // Translate a platform mention into this group's configured trigger.
     if (this.botOpenId && mentions.length > 0) {
       const isBotMentioned = mentions.some(
         (m: any) => m.id?.open_id === this.botOpenId,
       );
-      if (isBotMentioned && !TRIGGER_PATTERN.test(content)) {
-        content = `@${ASSISTANT_NAME} ${content}`;
+      if (isBotMentioned && !matchesTrigger(content, configuredTrigger)) {
+        content = `${configuredTrigger} ${content}`;
       }
     }
 
@@ -158,12 +177,13 @@ export class FeishuChannel implements Channel {
     this.opts.onChatMetadata(chatJid, timestamp, chatName, 'feishu', isGroup);
 
     // Only deliver full message for registered groups
-    const group = this.opts.registeredGroups()[chatJid];
     if (!group) {
-      logger.debug(
-        { chatJid, chatName },
-        'Message from unregistered Feishu chat',
-      );
+      logSecurityBoundaryDenied({
+        boundary: 'channel_registration',
+        channel: 'feishu',
+        groupClass: isGroup ? 'group' : 'direct',
+        reasonCode: 'unregistered_remote',
+      });
       return;
     }
 
@@ -321,8 +341,9 @@ export class FeishuChannel implements Channel {
 
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.wsClient) {
-      logger.warn('Feishu bot not initialized');
-      return;
+      const error = new Error('Feishu bot not initialized');
+      logger.warn(error.message);
+      throw error;
     }
 
     try {
@@ -359,7 +380,81 @@ export class FeishuChannel implements Channel {
       }
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Feishu message');
+      throw err;
     }
+  }
+
+  async startMessageStream(jid: string): Promise<StreamingMessage | null> {
+    if (!this.wsClient) {
+      throw new Error('Feishu bot not initialized');
+    }
+
+    const chatId = jid.replace(/^feishu:/, '');
+    let controller: Lark.MarkdownStreamController | undefined;
+    let finishProducer!: () => void;
+    let failProducer!: (error: Error) => void;
+    let resolveReady!: () => void;
+    let rejectReady!: (error: unknown) => void;
+
+    const producerDone = new Promise<void>((resolve, reject) => {
+      finishProducer = resolve;
+      failProducer = reject;
+    });
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+
+    const runPromise = this.outboundChannel.stream(chatId, {
+      markdown: async (streamController) => {
+        controller = streamController;
+        resolveReady();
+        await producerDone;
+      },
+    });
+    void runPromise.catch(rejectReady);
+    await ready;
+
+    let closed = false;
+    return {
+      append: async (delta: string) => {
+        if (closed || !delta) return;
+        await controller!.append(delta);
+      },
+      complete: async (finalText: string) => {
+        if (closed) return;
+        closed = true;
+        try {
+          // The final SDK result is canonical. setContent also corrects a
+          // partial stream that included pre-tool assistant chatter.
+          await controller!.setContent(finalText);
+          finishProducer();
+          await runPromise;
+        } catch (err) {
+          failProducer(err instanceof Error ? err : new Error(String(err)));
+          try {
+            await runPromise;
+          } catch {
+            // Preserve the original delivery error below.
+          }
+          throw err;
+        }
+      },
+      fail: async (error?: unknown) => {
+        if (closed) return;
+        closed = true;
+        failProducer(
+          error instanceof Error
+            ? error
+            : new Error(String(error || 'Assistant stream failed')),
+        );
+        try {
+          await runPromise;
+        } catch {
+          // The SDK has already put the card into its failed terminal state.
+        }
+      },
+    };
   }
 
   isConnected(): boolean {

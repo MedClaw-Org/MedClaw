@@ -183,6 +183,9 @@ async function runTask(
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        // Scheduled-task delivery remains a single settled message. Partial
+        // model deltas are consumed only by the interactive chat path.
+        if (streamedOutput.streamDelta) return;
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)

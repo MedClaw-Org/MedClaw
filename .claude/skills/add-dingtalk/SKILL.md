@@ -1,6 +1,6 @@
 ---
 name: add-dingtalk
-description: Add DingTalk (钉钉) as a channel using Stream Mode. No public URL needed. Supports group and direct message conversations with self-registration commands.
+description: Add DingTalk (钉钉) as a channel using Stream Mode. No public URL needed. Supports group and direct message conversations with local-only registration.
 ---
 
 # Add DingTalk Channel
@@ -101,19 +101,22 @@ Tell the user:
 > 2. Send `/chatid` in that conversation
 > 3. The bot will reply with the conversation ID (format: `dingtalk:xxxx`) and registration status
 
-### Self-Registration (Recommended)
+### Local Registration
 
-Users can register groups directly from the chat:
+Registration and `main` privilege changes must run on the MedClaw host. Chat commands intentionally cannot change either setting. Use the registration setup step with the Chat ID returned by `/chatid`:
 
+```bash
+npx tsx setup/index.ts --step register -- \
+  --channel dingtalk \
+  --jid 'dingtalk:<conversation-id>' \
+  --name '<conversation-name>' \
+  --folder 'dingtalk_main' \
+  --trigger '@Andy' \
+  --no-trigger-required \
+  --is-main
 ```
-/register 名称|文件夹|触发器
-```
 
-Example: `/register 我的群|my_group|@Andy`
-
-The bot will validate inputs, create the group folder with CLAUDE.md, and register in the database. Registration sets `requiresTrigger: false` — all messages are routed without needing a trigger.
-
-### Manual Registration
+Only use `--is-main` for a host-operator-controlled conversation. Assigning it demotes the previous main group.
 
 For a main conversation (responds to all messages):
 
@@ -135,21 +138,11 @@ Commands that work even for unregistered conversations:
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `/chatid` | `！chatid` | Show conversation ID and registration status |
-| `/register` | `！register` | Show registration help |
-| `/register 名称\|文件夹\|触发器` | `！register ...` | Self-register the conversation |
+| `/register` | `！register` | Show local registration instructions |
+| `/register ...` | `！register ...` | Refuse remote registration and show local instructions |
 | `/ping` | `！ping` | Check if bot is online |
 
-Commands for registered conversations only:
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `/set-main` | `！设置主群` | Set as main group (requires confirmation) |
-| `/set-main-confirm` | `！确认设置主群` | Confirm setting as main |
-| `/unset-main` | `！取消主群` | Remove main group status (requires confirmation) |
-| `/unset-main-confirm` | `！确认取消主群` | Confirm removing main status |
-| `/cancel` | `！取消` | Cancel pending operation |
-
-Confirmation commands expire after **60 seconds**.
+`/set-main`, `/unset-main`, and their former confirmation aliases are refused with local-only instructions.
 
 ## Phase 5: Verify
 

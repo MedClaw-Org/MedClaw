@@ -86,14 +86,20 @@ AskUserQuestion: Claude subscription (Pro/Max) vs Anthropic API key?
 ## 5. Set Up Channels
 
 AskUserQuestion (multiSelect): Which messaging channels do you want to enable?
-- WhatsApp (authenticates via QR code or pairing code)
-- Telegram (authenticates via bot token from @BotFather)
-- Slack (authenticates via Slack app with Socket Mode)
-- Discord (authenticates via Discord bot token)
+- DingTalk (included; Stream Mode Client ID and Client Secret)
+- Feishu/Lark (included; App ID and App Secret)
+- QQ Bot (included; Bot App ID and App Secret)
+- Optional channel skill: WhatsApp, Telegram, Slack, or Discord
 
 **Delegate to each selected channel's own skill.** Each channel skill handles its own code installation, authentication, registration, and JID resolution. This avoids duplicating channel-specific logic and ensures JIDs are always correct.
 
-For each selected channel, invoke its skill:
+For each selected included channel, configure its existing adapter:
+
+- **DingTalk:** Continue at Phase 3 of `/add-dingtalk`; do not re-apply the code package when `src/channels/dingtalk.ts` already exists.
+- **Feishu/Lark:** Continue at Phase 3 of `/add-feishu`; do not re-apply the code package when `src/channels/feishu.ts` already exists.
+- **QQ Bot:** Have the user place `QQ_BOT_APP_ID` and `QQ_BOT_APP_SECRET` in `.env`, restart, send the bot a message, and obtain the `qq:group:` or `qq:user:` JID from logs/database.
+
+For optional channels, invoke the corresponding skill:
 
 - **WhatsApp:** Invoke `/add-whatsapp`
 - **Telegram:** Invoke `/add-telegram`
@@ -106,6 +112,14 @@ Each skill will:
 3. Authenticate (WhatsApp QR/pairing, or verify token-based connection)
 4. Register the chat with the correct JID format
 5. Build and verify
+
+For every channel, assign registration and `main` only with the local command below; never ask a chat command to grant itself access:
+
+```bash
+npx tsx setup/index.ts --step register -- --channel <channel> --jid '<jid>' --name '<name>' --folder '<folder>' --trigger '@Andy' --no-trigger-required --is-main
+```
+
+Use `--is-main` only for the one operator-controlled administrative conversation.
 
 **After all channel skills complete**, continue to step 6.
 

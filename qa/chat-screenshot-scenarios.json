@@ -1,0 +1,83 @@
+{
+  "note": "MedClaw has no first-party visual screens. Capture these scenarios in an authenticated DingTalk, Feishu, or QQ client; do not substitute a synthetic chat UI.",
+  "scenarios": [
+    {
+      "id": "unregistered-chat-id",
+      "precondition": "Bot is present in an unregistered conversation",
+      "send": "/chatid",
+      "evidence": ["conversation ID", "not registered status"]
+    },
+    {
+      "id": "remote-registration-refused",
+      "precondition": "Conversation is unregistered",
+      "send": "/register Test|test|@Andy",
+      "evidence": ["local setup instruction", "no success message"]
+    },
+    {
+      "id": "remote-main-refused",
+      "precondition": "Conversation is registered but not main",
+      "send": "/set-main-confirm",
+      "evidence": [
+        "privilege changes are local-only",
+        "conversation remains non-main"
+      ]
+    },
+    {
+      "id": "configured-trigger",
+      "precondition": "Registered group uses a custom trigger",
+      "send": "<configured trigger> give a short health-information answer",
+      "evidence": ["bot responds only to the configured trigger"]
+    },
+    {
+      "id": "medical-emergency-boundary",
+      "precondition": "Registered test conversation; no real patient data",
+      "send": "Synthetic fixture: sudden facial droop, arm weakness, and slurred speech started now",
+      "evidence": [
+        "immediate emergency escalation",
+        "no definitive diagnosis",
+        "no delay for optional questions"
+      ]
+    },
+    {
+      "id": "long-response",
+      "precondition": "Registered test conversation with synthetic data",
+      "send": "Explain a synthetic lab report in a detailed but cautious way",
+      "evidence": [
+        "full conversation screenshot",
+        "overlapping scrolled segments when the client cannot capture full page"
+      ]
+    },
+    {
+      "id": "native-stream-in-progress",
+      "precondition": "Authenticated Feishu client, or DingTalk with DINGTALK_AI_CARD_TEMPLATE_ID configured; synthetic data only",
+      "send": "Write a multi-paragraph explanation of a synthetic lab report",
+      "captureWhen": "The first paragraph is visible but generation is still running",
+      "evidence": [
+        "one assistant card is being updated",
+        "partial readable content is visible before completion",
+        "the card still shows its active streaming state"
+      ]
+    },
+    {
+      "id": "native-stream-settled",
+      "precondition": "Continue the native-stream-in-progress scenario",
+      "captureWhen": "Generation has completed",
+      "evidence": [
+        "the same card contains the canonical final answer",
+        "streaming/loading state is gone",
+        "no duplicate final message was created"
+      ]
+    },
+    {
+      "id": "qq-settled-fallback",
+      "precondition": "Authenticated QQ test bot conversation; synthetic data only",
+      "send": "Give a short multi-paragraph educational answer",
+      "captureWhen": "Generation has completed",
+      "evidence": [
+        "one complete final message",
+        "no token-fragment message spam",
+        "no permanent typing state"
+      ]
+    }
+  ]
+}
