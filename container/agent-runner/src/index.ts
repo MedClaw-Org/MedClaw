@@ -24,6 +24,9 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+import { buildAgentPolicy } from './agent-policy.js';
+import { BrokerProviderEnv, buildSdkEnv } from './provider-env.js';
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -32,7 +35,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
-  secrets?: Record<string, string>;
+  providerEnv?: BrokerProviderEnv;
 }
 
 interface ContainerOutput {
@@ -460,7 +463,16 @@ async function runQuery(
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
-  const systemPromptAppend = [MEDICAL_SAFETY_SYSTEM_PROMPT, globalClaudeMd]
+  const groupClaudeMdPath = '/workspace/group/CLAUDE.md';
+  const groupClaudeMd =
+    !containerInput.isMain && fs.existsSync(groupClaudeMdPath)
+      ? fs.readFileSync(groupClaudeMdPath, 'utf-8')
+      : undefined;
+  const systemPromptAppend = [
+    MEDICAL_SAFETY_SYSTEM_PROMPT,
+    globalClaudeMd,
+    groupClaudeMd,
+  ]
     .filter((value): value is string => Boolean(value))
     .join('\n\n');
 
@@ -480,6 +492,8 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const agentPolicy = buildAgentPolicy(containerInput.isMain);
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -492,31 +506,8 @@ async function runQuery(
         preset: 'claude_code' as const,
         append: systemPromptAppend,
       },
-      allowedTools: [
-        'Bash',
-        'Read',
-        'Write',
-        'Edit',
-        'Glob',
-        'Grep',
-        'WebSearch',
-        'WebFetch',
-        'Task',
-        'TaskOutput',
-        'TaskStop',
-        'TeamCreate',
-        'TeamDelete',
-        'SendMessage',
-        'TodoWrite',
-        'ToolSearch',
-        'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-      ],
+      ...agentPolicy,
       env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
       mcpServers: {
         nanoclaw: {
           command: 'node',
@@ -628,14 +619,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Build the SDK child environment without mutating the runner environment.
-  // The Bash pre-tool hook strips direct inheritance by Bash tool subprocesses;
-  // see docs/SECURITY.md for the remaining same-container risk.
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
-  for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    sdkEnv[key] = value;
-  }
-  delete containerInput.secrets;
+  // Strip any inherited provider auth and accept only the short-lived host
+  // broker capability. Raw provider credentials never enter this process.
+  const sdkEnv = buildSdkEnv(process.env, containerInput.providerEnv);
+  delete containerInput.providerEnv;
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');

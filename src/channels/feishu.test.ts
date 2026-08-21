@@ -11,14 +11,13 @@ vi.mock('../config.js', () => ({
     content.trim().toLowerCase().startsWith(trigger.trim().toLowerCase()),
 }));
 
-vi.mock('../logger.js', () => ({
-  logger: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
+const loggerRef = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
+vi.mock('../logger.js', () => ({ logger: loggerRef }));
 
 // --- @larksuiteoapi/node-sdk mock ---
 
@@ -304,6 +303,16 @@ describe('FeishuChannel', () => {
 
       expect(opts.onChatMetadata).toHaveBeenCalled();
       expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(loggerRef.warn).toHaveBeenCalledWith(
+        {
+          event: 'security_boundary_denied',
+          boundary: 'channel_registration',
+          channel: 'feishu',
+          group_class: 'group',
+          reason_code: 'unregistered_remote',
+        },
+        'Security boundary denied',
+      );
     });
 
     it('skips messages with no message data', async () => {

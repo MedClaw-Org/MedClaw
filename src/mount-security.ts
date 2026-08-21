@@ -12,6 +12,10 @@ import path from 'path';
 import pino from 'pino';
 
 import { MOUNT_ALLOWLIST_PATH } from './config.js';
+import {
+  logSecurityBoundaryDenied,
+  SecurityReasonCode,
+} from './security-events.js';
 import { AdditionalMount, AllowedRoot, MountAllowlist } from './types.js';
 
 const logger = pino({
@@ -221,6 +225,7 @@ function isValidContainerPath(containerPath: string): boolean {
 export interface MountValidationResult {
   allowed: boolean;
   reason: string;
+  reasonCode?: SecurityReasonCode;
   realHostPath?: string;
   resolvedContainerPath?: string;
   effectiveReadonly?: boolean;
@@ -241,6 +246,7 @@ export function validateMount(
     return {
       allowed: false,
       reason: `No mount allowlist configured at ${MOUNT_ALLOWLIST_PATH}`,
+      reasonCode: 'allowlist_missing',
     };
   }
 
@@ -252,6 +258,7 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Invalid container path: "${containerPath}" - must be relative, non-empty, and not contain ".."`,
+      reasonCode: 'invalid_container_path',
     };
   }
 
@@ -263,6 +270,7 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Host path does not exist: "${mount.hostPath}" (expanded: "${expandedPath}")`,
+      reasonCode: 'host_path_missing',
     };
   }
 
@@ -275,6 +283,7 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Path matches blocked pattern "${blockedMatch}": "${realPath}"`,
+      reasonCode: 'blocked_host_path',
     };
   }
 
@@ -286,6 +295,7 @@ export function validateMount(
       reason: `Path "${realPath}" is not under any allowed root. Allowed roots: ${allowlist.allowedRoots
         .map((r) => expandPath(r.path))
         .join(', ')}`,
+      reasonCode: 'outside_allowlist',
     };
   }
 
@@ -369,15 +379,12 @@ export function validateAdditionalMounts(
         'Mount validated successfully',
       );
     } else {
-      logger.warn(
-        {
-          group: groupName,
-          requestedPath: mount.hostPath,
-          containerPath: mount.containerPath,
-          reason: result.reason,
-        },
-        'Additional mount REJECTED',
-      );
+      logSecurityBoundaryDenied({
+        boundary: 'container_mount',
+        channel: 'internal',
+        groupClass: isMain ? 'main' : 'non_main',
+        reasonCode: result.reasonCode || 'invalid_reason_code',
+      });
     }
   }
 

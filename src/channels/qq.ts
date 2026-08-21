@@ -4,6 +4,7 @@ import WebSocket from 'ws';
 import { ASSISTANT_NAME, matchesTrigger } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { logSecurityBoundaryDenied } from '../security-events.js';
 import { ChannelOpts, registerChannel } from './registry.js';
 import {
   Channel,
@@ -30,7 +31,6 @@ export interface QQBotChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
-  registerGroup?: (jid: string, group: RegisteredGroup) => void;
 }
 
 export class QQBotChannel implements Channel {
@@ -255,22 +255,15 @@ export class QQBotChannel implements Channel {
 
     this.opts.onChatMetadata(chatJid, timestamp, groupOpenId, 'qq', true);
 
-    let group = this.opts.registeredGroups()[chatJid];
+    const group = this.opts.registeredGroups()[chatJid];
     if (!group) {
-      if (!this.opts.registerGroup) {
-        logger.debug({ chatJid }, 'QQ group not registered');
-        return;
-      }
-      const folder = `qq_group-${groupOpenId.slice(0, 8).toLowerCase()}`;
-      group = {
-        name: `QQ Group ${groupOpenId.slice(0, 8)}`,
-        folder,
-        trigger: `@${ASSISTANT_NAME}`,
-        added_at: timestamp,
-        requiresTrigger: true,
-      };
-      this.opts.registerGroup(chatJid, group);
-      logger.info({ chatJid, folder }, 'QQ group auto-registered');
+      logSecurityBoundaryDenied({
+        boundary: 'channel_registration',
+        channel: 'qq',
+        groupClass: 'group',
+        reasonCode: 'unregistered_remote',
+      });
+      return;
     }
 
     // QQ group events are always bot mentions. Normalize the platform mention
@@ -308,22 +301,15 @@ export class QQBotChannel implements Channel {
 
     this.opts.onChatMetadata(chatJid, timestamp, userOpenId, 'qq', false);
 
-    let group = this.opts.registeredGroups()[chatJid];
+    const group = this.opts.registeredGroups()[chatJid];
     if (!group) {
-      if (!this.opts.registerGroup) {
-        logger.debug({ chatJid }, 'QQ C2C not registered');
-        return;
-      }
-      const folder = `qq_user-${userOpenId.slice(0, 8).toLowerCase()}`;
-      group = {
-        name: `QQ User ${userOpenId.slice(0, 8)}`,
-        folder,
-        trigger: `@${ASSISTANT_NAME}`,
-        added_at: timestamp,
-        requiresTrigger: false,
-      };
-      this.opts.registerGroup(chatJid, group);
-      logger.info({ chatJid, folder }, 'QQ C2C auto-registered');
+      logSecurityBoundaryDenied({
+        boundary: 'channel_registration',
+        channel: 'qq',
+        groupClass: 'direct',
+        reasonCode: 'unregistered_remote',
+      });
+      return;
     }
 
     let text = content.trim();

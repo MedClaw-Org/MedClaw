@@ -2,6 +2,10 @@ import fs from 'fs';
 
 import { SENDER_ALLOWLIST_PATH } from './config.js';
 import { logger } from './logger.js';
+import {
+  logSecurityBoundaryDenied,
+  securityChannelFromJid,
+} from './security-events.js';
 
 export interface ChatAllowlistEntry {
   allow: '*' | string[];
@@ -119,10 +123,12 @@ export function isTriggerAllowed(
 ): boolean {
   const allowed = isSenderAllowed(chatJid, sender, cfg);
   if (!allowed && cfg.logDenied) {
-    logger.debug(
-      { chatJid, sender },
-      'sender-allowlist: trigger denied for sender',
-    );
+    logSecurityBoundaryDenied({
+      boundary: 'sender_allowlist',
+      channel: securityChannelFromJid(chatJid),
+      groupClass: 'non_main',
+      reasonCode: 'sender_not_allowed',
+    });
   }
   return allowed;
 }

@@ -8,6 +8,10 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import {
+  logSecurityBoundaryDenied,
+  SecurityReasonCode,
+} from './security-events.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -86,10 +90,12 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'IPC message sent',
                   );
                 } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
+                  logSecurityBoundaryDenied({
+                    boundary: 'ipc_authorization',
+                    channel: 'internal',
+                    groupClass: isMain ? 'main' : 'non_main',
+                    reasonCode: 'cross_group_message',
+                  });
                 }
               }
               fs.unlinkSync(filePath);
@@ -177,6 +183,13 @@ export async function processTaskIpc(
   deps: IpcDeps,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
+  const deny = (reasonCode: SecurityReasonCode): void =>
+    logSecurityBoundaryDenied({
+      boundary: 'ipc_authorization',
+      channel: 'internal',
+      groupClass: isMain ? 'main' : 'non_main',
+      reasonCode,
+    });
 
   switch (data.type) {
     case 'schedule_task':
@@ -191,10 +204,7 @@ export async function processTaskIpc(
         const targetGroupEntry = registeredGroups[targetJid];
 
         if (!targetGroupEntry) {
-          logger.warn(
-            { targetJid },
-            'Cannot schedule task: target group not registered',
-          );
+          deny('target_not_registered');
           break;
         }
 
@@ -202,10 +212,7 @@ export async function processTaskIpc(
 
         // Authorization: non-main groups can only schedule for themselves
         if (!isMain && targetFolder !== sourceGroup) {
-          logger.warn(
-            { sourceGroup, targetFolder },
-            'Unauthorized schedule_task attempt blocked',
-          );
+          deny('cross_group_task');
           break;
         }
 
@@ -281,10 +288,7 @@ export async function processTaskIpc(
             'Task paused via IPC',
           );
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task pause attempt',
-          );
+          deny('task_not_owned');
         }
       }
       break;
@@ -299,10 +303,7 @@ export async function processTaskIpc(
             'Task resumed via IPC',
           );
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task resume attempt',
-          );
+          deny('task_not_owned');
         }
       }
       break;
@@ -317,10 +318,7 @@ export async function processTaskIpc(
             'Task cancelled via IPC',
           );
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task cancel attempt',
-          );
+          deny('task_not_owned');
         }
       }
       break;
@@ -342,28 +340,19 @@ export async function processTaskIpc(
           new Set(Object.keys(registeredGroups)),
         );
       } else {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized refresh_groups attempt blocked',
-        );
+        deny('main_required');
       }
       break;
 
     case 'register_group':
       // Only main group can register new groups
       if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized register_group attempt blocked',
-        );
+        deny('main_required');
         break;
       }
       if (data.jid && data.name && data.folder && data.trigger) {
         if (!isValidGroupFolder(data.folder)) {
-          logger.warn(
-            { sourceGroup, folder: data.folder },
-            'Invalid register_group request - unsafe folder name',
-          );
+          deny('unsafe_group_folder');
           break;
         }
         // Defense in depth: agent cannot set isMain via IPC
@@ -376,14 +365,11 @@ export async function processTaskIpc(
           requiresTrigger: data.requiresTrigger,
         });
       } else {
-        logger.warn(
-          { data },
-          'Invalid register_group request - missing required fields',
-        );
+        deny('missing_required_fields');
       }
       break;
 
     default:
-      logger.warn({ type: data.type }, 'Unknown IPC task type');
+      deny('unknown_operation');
   }
 }

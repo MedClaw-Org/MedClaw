@@ -58,6 +58,10 @@ import {
   StreamingMessage,
 } from './types.js';
 import { logger } from './logger.js';
+import {
+  logSecurityBoundaryDenied,
+  securityChannelFromJid,
+} from './security-events.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -617,10 +621,13 @@ async function main(): Promise<void> {
           !isSenderAllowed(chatJid, msg.sender, cfg)
         ) {
           if (cfg.logDenied) {
-            logger.debug(
-              { chatJid, sender: msg.sender },
-              'sender-allowlist: dropping message (drop mode)',
-            );
+            logSecurityBoundaryDenied({
+              boundary: 'sender_allowlist',
+              channel: securityChannelFromJid(chatJid),
+              groupClass:
+                registeredGroups[chatJid].isMain === true ? 'main' : 'non_main',
+              reasonCode: 'sender_not_allowed',
+            });
           }
           return;
         }
@@ -635,7 +642,6 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
-    registerGroup,
   };
 
   // Create and connect all registered channels.

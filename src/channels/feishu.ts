@@ -3,6 +3,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { ASSISTANT_NAME, matchesTrigger } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { logSecurityBoundaryDenied } from '../security-events.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -177,10 +178,12 @@ export class FeishuChannel implements Channel {
 
     // Only deliver full message for registered groups
     if (!group) {
-      logger.debug(
-        { chatJid, chatName },
-        'Message from unregistered Feishu chat',
-      );
+      logSecurityBoundaryDenied({
+        boundary: 'channel_registration',
+        channel: 'feishu',
+        groupClass: isGroup ? 'group' : 'direct',
+        reasonCode: 'unregistered_remote',
+      });
       return;
     }
 

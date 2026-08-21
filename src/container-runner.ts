@@ -15,9 +15,19 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
-import { readEnvFile } from './env.js';
+import {
+  loadProviderCredential,
+  startProviderCredentialBroker,
+} from './credential-broker.js';
+import {
+  AgentControlPlaneError,
+  assertUniqueMountDestinations,
+  CLAUDE_RUNTIME_STATE_DIRS,
+  prepareAgentControlPlane,
+} from './agent-control-plane.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { logSecurityBoundaryDenied } from './security-events.js';
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
@@ -38,7 +48,6 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
-  secrets?: Record<string, string>;
 }
 
 export interface ContainerOutput {
@@ -79,7 +88,7 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
+    // Provider authentication remains in the host credential broker.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -124,72 +133,38 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
-
-  // Sync only explicitly reviewed skills into each group's .claude/skills/.
-  // The repository may contain a large third-party catalog; presence alone is
-  // not approval to execute a skill in a medical assistant.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsAllowlist = path.join(
     process.cwd(),
     'container',
     'skills-allowlist.txt',
   );
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc) && fs.existsSync(skillsAllowlist)) {
-    const approvedSkills = fs
-      .readFileSync(skillsAllowlist, 'utf-8')
-      .split('\n')
-      .map((line) => line.replace(/#.*$/, '').trim())
-      .filter(Boolean);
-    for (const skillDir of approvedSkills) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      const skillFile = path.join(srcDir, 'SKILL.md');
-      if (!fs.existsSync(skillFile) || !fs.statSync(srcDir).isDirectory()) {
-        logger.warn({ skillDir }, 'Approved skill is missing; skipping');
-        continue;
-      }
-      const skillText = fs.readFileSync(skillFile, 'utf-8');
-      if (
-        skillText.startsWith('version https://git-lfs.github.com/spec/v1') ||
-        !skillText.startsWith('---\n')
-      ) {
-        logger.warn({ skillDir }, 'Approved skill failed integrity checks');
-        continue;
-      }
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  } else {
-    logger.warn('Medical skill allowlist missing; no bundled skills synced');
-  }
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
+  const controlPlane = prepareAgentControlPlane({
+    allowlistFile: skillsAllowlist,
+    dataDir: DATA_DIR,
+    groupFolder: group.folder,
+    skillsSourceDir: skillsSrc,
   });
+  // Mount the whole Claude control plane read-only. Only explicit runtime-state
+  // subdirectories are overlaid writable below, so new SDK config surfaces do
+  // not silently become persistent capabilities.
+  mounts.push({
+    hostPath: controlPlane.rootDir,
+    containerPath: '/home/node/.claude',
+    readonly: true,
+  });
+  const mutableClaudeDirs = isMain
+    ? [...CLAUDE_RUNTIME_STATE_DIRS]
+    : ['projects'];
+  for (const directory of mutableClaudeDirs) {
+    const hostPath = path.join(groupSessionsDir, directory);
+    fs.mkdirSync(hostPath, { recursive: true });
+    mounts.push({
+      hostPath,
+      containerPath: `/home/node/.claude/${directory}`,
+      readonly: false,
+    });
+  }
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -213,20 +188,8 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  assertUniqueMountDestinations(mounts);
   return mounts;
-}
-
-/**
- * Read allowed secrets from .env for passing to the container via stdin.
- * Secrets are never written to disk or mounted as files.
- */
-function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-  ]);
 }
 
 function buildContainerArgs(
@@ -234,6 +197,7 @@ function buildContainerArgs(
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  args.push('--add-host', 'host.docker.internal:host-gateway');
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -269,10 +233,35 @@ export async function runContainerAgent(
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
-  const groupDir = resolveGroupFolderPath(group.folder);
-  fs.mkdirSync(groupDir, { recursive: true });
+  if (input.isMain !== (group.isMain === true)) {
+    logSecurityBoundaryDenied({
+      boundary: 'container_policy',
+      channel: 'internal',
+      groupClass: group.isMain === true ? 'main' : 'non_main',
+      reasonCode: 'privilege_mismatch',
+    });
+    throw new Error('container_policy:privilege_mismatch');
+  }
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  let groupDir: string;
+  let mounts: VolumeMount[];
+  try {
+    groupDir = resolveGroupFolderPath(group.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    mounts = buildVolumeMounts(group, input.isMain);
+  } catch (err) {
+    const reasonCode =
+      err instanceof AgentControlPlaneError
+        ? err.reasonCode
+        : 'invalid_container_config';
+    logSecurityBoundaryDenied({
+      boundary: 'container_policy',
+      channel: 'internal',
+      groupClass: group.isMain === true ? 'main' : 'non_main',
+      reasonCode,
+    });
+    throw err;
+  }
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -303,7 +292,18 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
-  return new Promise((resolve) => {
+  const providerCredential = loadProviderCredential();
+  const credentialBroker = providerCredential
+    ? await startProviderCredentialBroker(providerCredential, {
+        groupClass: input.isMain ? 'main' : 'non_main',
+      })
+    : null;
+  const containerPayload = JSON.stringify({
+    ...input,
+    ...(credentialBroker ? { providerEnv: credentialBroker.containerEnv } : {}),
+  });
+
+  return new Promise<ContainerOutput>((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -315,12 +315,10 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = readSecrets();
-    container.stdin.write(JSON.stringify(input));
+    // Stdin contains only ordinary input plus an opaque, per-container broker
+    // capability. The raw provider credential stays in the host broker.
+    container.stdin.write(containerPayload);
     container.stdin.end();
-    // Remove secrets from input so they don't appear in logs
-    delete input.secrets;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
@@ -669,6 +667,8 @@ export async function runContainerAgent(
         error: `Container spawn error: ${err.message}`,
       });
     });
+  }).finally(async () => {
+    await credentialBroker?.close();
   });
 }
 

@@ -4,7 +4,15 @@ const axiosRef = vi.hoisted(() => ({
   request: vi.fn(async (_request: any) => ({ data: {} })),
 }));
 
+const loggerRef = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
 vi.mock('axios', () => ({ default: axiosRef.request }));
+vi.mock('../logger.js', () => ({ logger: loggerRef }));
 
 import { DingTalkChannel } from './dingtalk.js';
 
@@ -20,6 +28,7 @@ describe('DingTalkChannel', () => {
 
   beforeEach(() => {
     axiosRef.request.mockClear();
+    vi.clearAllMocks();
   });
 
   describe('constructor', () => {
@@ -258,6 +267,19 @@ describe('DingTalkChannel', () => {
       expect(send).toHaveBeenCalledWith(
         'dingtalk:conv-security',
         expect.stringContaining('请在 MedClaw 主机上'),
+      );
+      expect(loggerRef.warn).toHaveBeenCalledWith(
+        {
+          event: 'security_boundary_denied',
+          boundary: 'channel_registration',
+          channel: 'dingtalk',
+          group_class: 'group',
+          reason_code: 'remote_privilege_command',
+        },
+        'Security boundary denied',
+      );
+      expect(JSON.stringify(loggerRef.warn.mock.calls)).not.toContain(
+        'Mallory',
       );
     });
 

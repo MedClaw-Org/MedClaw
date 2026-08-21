@@ -5,6 +5,7 @@ import { DWClient, TOPIC_ROBOT, RobotMessage, EventAck } from 'dingtalk-stream';
 import { ASSISTANT_NAME } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { logSecurityBoundaryDenied } from '../security-events.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -228,6 +229,12 @@ export class DingTalkChannel implements Channel {
         content === '/unset-main-confirm' ||
         content === '！确认取消主群'
       ) {
+        logSecurityBoundaryDenied({
+          boundary: 'channel_registration',
+          channel: 'dingtalk',
+          groupClass: isGroup ? 'group' : 'direct',
+          reasonCode: 'remote_privilege_command',
+        });
         if (group) {
           await this.sendMessage(
             chatJid,
@@ -251,10 +258,12 @@ export class DingTalkChannel implements Channel {
 
     // If not registered and not a command, ignore
     if (!group) {
-      logger.debug(
-        { chatJid, conversationId },
-        'Message from unregistered DingTalk conversation',
-      );
+      logSecurityBoundaryDenied({
+        boundary: 'channel_registration',
+        channel: 'dingtalk',
+        groupClass: isGroup ? 'group' : 'direct',
+        reasonCode: 'unregistered_remote',
+      });
       return;
     }
 
